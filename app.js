@@ -40,6 +40,11 @@ let state = {
   recordSearch: '',
   recordSelectedId: null,
   recordDeleting: null,
+  recordsView: 'time',        // 'time' (month/year timeline) | 'episodes' (thread list)
+  episodes: [],
+  openEpisodeId: null,        // when viewing a single episode's detail
+  fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
+  episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
   planTab: 'overview',
   dailyLogDraft: { feeling: 7, symptoms: [], note: '', bp: '', meds: false },
   dailyLogSaving: false,
@@ -184,6 +189,7 @@ const db = {
       tags: r.tags || [], priority: r.priority || 'medium', source: r.source || 'manual',
       uploadedFile: r.uploaded_file_name, filePath: r.file_path,
       patientNameOnDoc: r.patient_name_on_doc, extracted: r.extracted_data || {},
+      episodeId: r.episode_id || null,
     }));
   },
   async addRecord(userId, rec) {
@@ -193,13 +199,50 @@ const db = {
       summary: rec.summary, tags: rec.tags || [], priority: rec.priority || 'medium',
       source: rec.source || 'manual', uploaded_file_name: rec.uploadedFile || null,
       file_path: rec.filePath || null, extracted_data: rec.extracted || {},
-      patient_name_on_doc: rec.patientNameOnDoc || null,
+      patient_name_on_doc: rec.patientNameOnDoc || null, episode_id: rec.episodeId || null,
     }]).select().single();
     if (error) throw error;
     return { ...rec, id: data.id };
   },
   async deleteRecord(recordId) {
     const { error } = await supabaseClient.from('medical_records').delete().eq('id', recordId);
+    if (error) throw error;
+  },
+  async setRecordEpisode(recordId, episodeId) {
+    const { error } = await supabaseClient.from('medical_records').update({ episode_id: episodeId || null }).eq('id', recordId);
+    if (error) throw error;
+  },
+  // ── Episodes ──
+  async getEpisodes(memberId) {
+    const { data, error } = await supabaseClient.from('episodes').select('*').eq('member_id', memberId).order('created_at', { ascending: false });
+    if (error) throw error;
+    return data.map(e => ({
+      id: e.id, mid: e.member_id, title: e.title, category: e.category,
+      status: e.status || 'active', description: e.description,
+      startedOn: e.started_on, color: e.color || C.teal,
+    }));
+  },
+  async addEpisode(userId, ep) {
+    const { data, error } = await supabaseClient.from('episodes').insert([{
+      owner_id: userId, member_id: ep.mid, title: ep.title, category: ep.category || null,
+      status: ep.status || 'active', description: ep.description || null,
+      color: ep.color || C.teal,
+    }]).select().single();
+    if (error) throw error;
+    return { id: data.id, mid: ep.mid, title: ep.title, category: ep.category, status: ep.status || 'active', description: ep.description, startedOn: data.started_on, color: ep.color || C.teal };
+  },
+  async updateEpisode(episodeId, patch) {
+    const upd = {};
+    if (patch.title !== undefined) upd.title = patch.title;
+    if (patch.status !== undefined) upd.status = patch.status;
+    if (patch.description !== undefined) upd.description = patch.description;
+    if (patch.category !== undefined) upd.category = patch.category;
+    const { error } = await supabaseClient.from('episodes').update(upd).eq('id', episodeId);
+    if (error) throw error;
+  },
+  async deleteEpisode(episodeId) {
+    // records referencing it are set null automatically by the FK (on delete set null)
+    const { error } = await supabaseClient.from('episodes').delete().eq('id', episodeId);
     if (error) throw error;
   },
   async uploadFile(file, userId) {
@@ -605,10 +648,37 @@ async function saveUploadRecord(memberId) {
       }
     };
     const saved = await db.addRecord(state.session.user.id, rec);
-    setState({ records: [saved, ...state.records], uploadModal: null });
+    // Switch to the member the doc was filed under, so its episodes are in context
+    if (memberId !== state.currentId) { await switchMember(memberId); }
+    setState({ records: [saved, ...state.records.filter(r => r.id !== saved.id)], uploadModal: null });
     showToast(`"${saved.title}" saved ✓`);
+    // AI proposes a thread: match against existing episodes, else propose new from diagnosis
+    proposeEpisodeForRecord(saved, ext);
   } catch (e) {
     setState({ uploadModal: { ...um, uploading: false, phase: 'error', errMsg: e.message } });
+  }
+}
+
+// After an upload, decide what thread to propose and open the filing modal.
+// Match logic: if the diagnosis/tags/title strongly overlap an existing episode's
+// title, pre-select it; otherwise propose creating a new thread named after the diagnosis.
+function proposeEpisodeForRecord(saved, ext) {
+  const hay = `${ext.diagnosis || ''} ${(ext.tags || []).join(' ')} ${saved.title || ''}`.toLowerCase();
+  const match = state.episodes.find(ep => {
+    const words = ep.title.toLowerCase().split(/[\s/]+/).filter(w => w.length > 3);
+    return words.some(w => hay.includes(w));
+  });
+  if (match) {
+    // Pre-file into the matched thread, but still show the modal so the user can confirm/change
+    setState({ fileModal: { recordId: saved.id, proposedNewTitle: '', proposedMatchId: match.id } });
+  } else {
+    const dx = ext.diagnosis;
+    let proposedNewTitle = '';
+    if (dx) proposedNewTitle = dx.length > 40 ? (ext.tags?.[0] || '') : dx;
+    // Only auto-open the filing modal if we have something to propose or existing threads to pick from
+    if (proposedNewTitle || state.episodes.length) {
+      setState({ fileModal: { recordId: saved.id, proposedNewTitle } });
+    }
   }
 }
 
@@ -823,7 +893,36 @@ function mountDashboardCharts() {
 // ─────────────────────────────────────────
 const RECORD_TABS = [{id:'all',label:'All'},{id:'prescription',label:'Prescriptions'},{id:'report',label:'Reports'},{id:'bill',label:'Bills'},{id:'xray',label:'X-Rays'},{id:'discharge',label:'Discharge'}];
 
+// ── Episode helpers ──
+function episodeById(id) { return state.episodes.find(e => e.id === id); }
+const EP_STATUS = {
+  active:     { label: 'Active',     cls: 'bg-teal-50 text-teal-700' },
+  monitoring: { label: 'Monitoring', cls: 'bg-amber-50 text-amber-700' },
+  resolved:   { label: 'Resolved',   cls: 'bg-stone-100 text-stone-500' },
+};
+function epStatus(s) { return EP_STATUS[s] || EP_STATUS.active; }
+// small pill shown on a document row indicating its thread (or "unfiled")
+function episodeTagHtml(record) {
+  const ep = record.episodeId ? episodeById(record.episodeId) : null;
+  if (ep) {
+    return `<button data-action="open-episode" data-id="${ep.id}" class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold hover:opacity-80" style="background:${ep.color}1a;color:${ep.color}">${iconHtml('git-branch',10)}${esc(ep.title)}</button>`;
+  }
+  return `<button data-action="file-record" data-id="${record.id}" class="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold bg-stone-100 text-stone-400 hover:bg-stone-200">${iconHtml('plus',10)} File to thread</button>`;
+}
+// group records by "Month YYYY"
+function groupByMonth(records) {
+  const groups = {};
+  records.forEach(r => {
+    const d = new Date(r.date);
+    const key = isNaN(d) ? 'Undated' : d.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+    (groups[key] = groups[key] || []).push(r);
+  });
+  return groups;
+}
+
 function renderRecords() {
+  // When a single episode is open, show its detail view instead of the list.
+  if (state.openEpisodeId) return renderEpisodeDetail();
   const m = currentMember();
   const filtered = state.records.filter(r =>
     (state.recordFilter === 'all' || r.type === state.recordFilter) &&
@@ -889,24 +988,275 @@ function renderRecords() {
       </div>
     </div>` : '';
 
+  // Build the month/year grouped timeline (time view)
+  const grouped = groupByMonth(filtered);
+  const monthKeys = Object.keys(grouped);
+  const timeListHtml = filtered.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('file-text',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">${state.recordSearch?'No records match':'No records yet'}</p>${!state.recordSearch?`<button data-action="open-upload" class="mt-4 px-5 py-2.5 text-white rounded-xl text-sm font-bold inline-flex items-center gap-2 hover:opacity-90" style="background:${C.teal}">${iconHtml('upload',14)} Upload First Record</button>`:''}</div>`
+    : monthKeys.map(month => `
+      <div class="mb-5">
+        <div class="flex items-center gap-2 mb-2 sticky top-0 bg-stone-50 py-1 z-10">
+          <p class="text-xs font-black text-stone-400 uppercase tracking-wider">${month}</p>
+          <div class="flex-1 h-px bg-stone-200"></div>
+          <span class="text-xs text-stone-400">${grouped[month].length}</span>
+        </div>
+        <div class="space-y-3">
+          ${grouped[month].map(r => {
+            const ts = typeStyle(r.type); const isSel = state.recordSelectedId === r.id;
+            let mobileExpand = '';
+            if (isSel && r.extracted) {
+              mobileExpand = `<div class="mt-3 pt-3 border-t border-stone-100 lg:hidden space-y-2">
+                ${r.extracted.diagnosis?`<p class="text-xs text-stone-600"><span class="font-bold">Dx:</span> ${esc(r.extracted.diagnosis)}</p>`:''}
+                ${(r.extracted.keyValues||[]).slice(0,4).map(kv=>`<div class="flex justify-between text-xs px-2 py-1.5 rounded-lg ${kv.status==='high'||kv.status==='low'?'bg-rose-50':kv.status==='borderline'?'bg-amber-50':'bg-stone-50'}"><span class="text-stone-500">${esc(kv.name)}</span><span class="font-bold ${statusColor(kv.status)}">${esc(kv.value)}</span></div>`).join('')}
+                ${r.extracted.advice?`<div class="p-2 bg-teal-50 rounded-lg text-xs text-teal-700">${esc(r.extracted.advice)}</div>`:''}
+                <button data-action="delete-record" data-id="${r.id}" class="text-xs text-rose-500 hover:text-rose-700 font-semibold flex items-center gap-1">${state.recordDeleting===r.id?spinnerHtml(12):''} Delete record</button>
+              </div>`;
+            }
+            return `<div class="bg-white rounded-2xl p-4 border transition-all hover:shadow-md ${isSel?'border-teal-400 shadow-md':'border-stone-100 shadow-sm'}">
+              <div class="flex items-start gap-3">
+                <div class="p-2.5 rounded-xl ${ts.bg} ${ts.text} flex-shrink-0 cursor-pointer" data-action="select-record" data-id="${r.id}">${iconHtml(ts.icon,18)}</div>
+                <div class="flex-1 min-w-0 cursor-pointer" data-action="select-record" data-id="${r.id}">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <p class="font-bold text-stone-900 text-sm">${esc(r.title)}</p>
+                    ${r.source==='upload'?badgeHtml('AI analysed','bg-teal-50 text-teal-700'):''}
+                    ${badgeHtml(r.priority, priBadge(r.priority)+' ml-auto')}
+                  </div>
+                  <p class="text-xs text-stone-400 mt-0.5 mb-1">${fmtDate(r.date)}${r.doctor?` · ${esc(r.doctor)}`:''}${r.hospital?` · ${esc(r.hospital)}`:''}${r.amount?` · ${fmtINR(r.amount)}`:''}</p>
+                  <p class="text-sm text-stone-600 line-clamp-2">${esc(r.summary)}</p>
+                </div>
+              </div>
+              <div class="flex items-center gap-1.5 mt-2 flex-wrap pl-11">${episodeTagHtml(r)}${(r.tags||[]).map(tag=>`<span class="text-xs bg-stone-100 text-stone-500 px-2 py-0.5 rounded-full">${esc(tag)}</span>`).join('')}</div>
+              ${mobileExpand}
+            </div>`;
+          }).join('')}
+        </div>
+      </div>`).join('');
+
+  // Episodes view: list of threads for this member
+  const episodesListHtml = state.episodes.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('git-branch',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No threads yet</p><p class="text-sm mt-1">Group related documents into a health thread — e.g. "Liver Treatment" or "RHD / Cardiac"</p><button data-action="new-episode" class="mt-4 px-5 py-2.5 text-white rounded-xl text-sm font-bold inline-flex items-center gap-2 hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Create First Thread</button></div>`
+    : `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">${state.episodes.map(ep => {
+        const count = state.records.filter(r => r.episodeId === ep.id).length;
+        const st = epStatus(ep.status);
+        return `<div class="bg-white rounded-2xl p-4 border border-stone-100 shadow-sm hover:shadow-md cursor-pointer transition-all" data-action="open-episode" data-id="${ep.id}">
+          <div class="flex items-start gap-3">
+            <div class="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style="background:${ep.color}1a">${iconHtml('git-branch',17,'')}<span style="color:${ep.color}"></span></div>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2"><p class="font-bold text-stone-900 text-sm">${esc(ep.title)}</p>${badgeHtml(st.label, st.cls + ' ml-auto')}</div>
+              ${ep.description?`<p class="text-xs text-stone-500 mt-1 line-clamp-2">${esc(ep.description)}</p>`:''}
+              <p class="text-xs text-stone-400 mt-1.5">${count} document${count!==1?'s':''}${ep.startedOn?` · since ${fmtDate(ep.startedOn)}`:''}</p>
+            </div>
+          </div>
+        </div>`;
+      }).join('')}</div>`;
+
+  const isTime = state.recordsView === 'time';
+
   return `
   <div class="fade-in">
     ${renderUploadModal()}
+    ${renderEpisodeEditor()}
+    ${renderFileModal()}
     <div class="flex gap-5">
       <div class="flex-1 min-w-0 space-y-4">
         <div class="flex items-center justify-between">
-          <div><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medical Records</h1><p class="text-xs text-stone-400 mt-0.5">${state.records.length} records · ${esc(m.name)}</p></div>
+          <div><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medical Records</h1><p class="text-xs text-stone-400 mt-0.5">${state.records.length} records · ${state.episodes.length} threads · ${esc(m.name)}</p></div>
           <button data-action="open-upload" class="flex items-center gap-2 px-4 py-2.5 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('upload',15)}<span class="hidden sm:inline">Upload Record</span><span class="sm:hidden">Upload</span></button>
         </div>
-        <div class="relative">${iconHtml('search',15,'absolute left-3.5 top-3 text-stone-400')}
-          <input id="record-search-input" value="${esc(state.recordSearch)}" placeholder="Search records…" class="w-full pl-9 pr-4 py-2.5 border border-stone-200 rounded-xl text-base focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white"/>
+
+        <!-- Time / Episodes toggle -->
+        <div class="flex items-center gap-2">
+          <div class="inline-flex bg-stone-100 rounded-xl p-1">
+            <button data-action="records-view" data-view="time" class="px-4 py-1.5 rounded-lg text-xs font-bold transition-colors" style="${isTime?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('calendar',13,'inline mr-1')} By Time</button>
+            <button data-action="records-view" data-view="episodes" class="px-4 py-1.5 rounded-lg text-xs font-bold transition-colors" style="${!isTime?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('git-branch',13,'inline mr-1')} By Thread</button>
+          </div>
+          ${!isTime?`<button data-action="new-episode" class="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50">${iconHtml('plus',13)} New Thread</button>`:''}
         </div>
-        <div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
-          ${RECORD_TABS.map(t=>`<button data-action="filter-records" data-filter="${t.id}" class="px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors" style="${state.recordFilter===t.id?`background:${C.teal};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}">${t.label}</button>`).join('')}
-        </div>
-        <div class="space-y-3">${listHtml}</div>
+
+        ${isTime ? `
+          <div class="relative">${iconHtml('search',15,'absolute left-3.5 top-3 text-stone-400')}
+            <input id="record-search-input" value="${esc(state.recordSearch)}" placeholder="Search records…" class="w-full pl-9 pr-4 py-2.5 border border-stone-200 rounded-xl text-base focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white"/>
+          </div>
+          <div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
+            ${RECORD_TABS.map(t=>`<button data-action="filter-records" data-filter="${t.id}" class="px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-colors" style="${state.recordFilter===t.id?`background:${C.teal};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}">${t.label}</button>`).join('')}
+          </div>
+          <div>${timeListHtml}</div>
+        ` : `<div>${episodesListHtml}</div>`}
       </div>
       ${sidePanel}
+    </div>
+  </div>`;
+}
+
+// ─────────────────────────────────────────
+//  EPISODE DETAIL VIEW  (the deep per-thread lens)
+// ─────────────────────────────────────────
+function renderEpisodeDetail() {
+  const ep = episodeById(state.openEpisodeId);
+  if (!ep) { state.openEpisodeId = null; return renderRecords(); }
+  const m = currentMember();
+  const docs = state.records.filter(r => r.episodeId === ep.id);
+  const st = epStatus(ep.status);
+  const grouped = groupByMonth(docs);
+
+  const timelineHtml = docs.length === 0
+    ? `<div class="text-center py-12 text-stone-400">${iconHtml('file-text',32,'mx-auto mb-2 opacity-30')}<p class="text-sm">No documents in this thread yet</p><p class="text-xs mt-1">File documents here from the "By Time" view, or on upload</p></div>`
+    : Object.keys(grouped).map(month => `
+      <div class="mb-4">
+        <p class="text-xs font-black text-stone-400 uppercase tracking-wider mb-2">${month}</p>
+        <div class="space-y-2">
+          ${grouped[month].map(r => { const ts = typeStyle(r.type); return `
+            <div class="bg-white rounded-xl p-3 border border-stone-100 shadow-sm flex items-start gap-3">
+              <div class="p-2 rounded-lg ${ts.bg} ${ts.text} flex-shrink-0 cursor-pointer" data-action="select-record" data-id="${r.id}">${iconHtml(ts.icon,15)}</div>
+              <div class="flex-1 min-w-0 cursor-pointer" data-action="select-record" data-id="${r.id}">
+                <p class="font-bold text-stone-900 text-sm">${esc(r.title)}</p>
+                <p class="text-xs text-stone-400">${fmtDate(r.date)}${r.doctor?` · ${esc(r.doctor)}`:''}</p>
+                <p class="text-xs text-stone-600 mt-0.5 line-clamp-1">${esc(r.summary)}</p>
+              </div>
+              <button data-action="unfile-record" data-id="${r.id}" title="Remove from thread" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-300 hover:text-rose-500">${iconHtml('x',14)}</button>
+            </div>`; }).join('')}
+        </div>
+      </div>`).join('');
+
+  return `
+  <div class="fade-in max-w-3xl">
+    ${renderUploadModal()}
+    ${renderEpisodeEditor()}
+    ${renderFileModal()}
+    ${(() => { const sel = state.records.find(r => r.id === state.recordSelectedId); return sel ? renderRecordDetailModal(sel) : ''; })()}
+    <button data-action="close-episode" class="flex items-center gap-1.5 text-sm font-bold text-stone-400 hover:text-stone-600 mb-4">${iconHtml('arrow-left',15)} Back to records</button>
+
+    <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5 mb-4">
+      <div class="flex items-start gap-3">
+        <div class="w-11 h-11 rounded-xl flex items-center justify-center flex-shrink-0" style="background:${ep.color}1a">${iconHtml('git-branch',20,'')}</div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <h1 class="text-lg font-bold text-stone-900">${esc(ep.title)}</h1>
+            ${badgeHtml(st.label, st.cls)}
+          </div>
+          <p class="text-xs text-stone-400 mt-0.5">${esc(m.name)}${ep.startedOn?` · since ${fmtDate(ep.startedOn)}`:''} · ${docs.length} document${docs.length!==1?'s':''}</p>
+          ${ep.description?`<p class="text-sm text-stone-600 mt-2">${esc(ep.description)}</p>`:''}
+        </div>
+        <button data-action="edit-episode" data-id="${ep.id}" class="p-2 rounded-lg hover:bg-stone-100 text-stone-400" title="Edit thread">${iconHtml('pencil',15)}</button>
+      </div>
+      <div class="flex gap-2 mt-4 pt-4 border-t border-stone-100">
+        <button data-action="edit-episode" data-id="${ep.id}" class="flex-1 py-2 border border-stone-200 rounded-xl text-xs font-bold text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('settings',13)} Edit / Status</button>
+        <button data-action="delete-episode" data-id="${ep.id}" class="flex-1 py-2 border border-rose-200 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-1">${iconHtml('trash-2',13)} Delete Thread</button>
+      </div>
+    </div>
+
+    <div class="mb-2 flex items-center gap-2">
+      <p class="text-sm font-bold text-stone-700">Timeline</p>
+      <div class="flex-1 h-px bg-stone-100"></div>
+    </div>
+    <p class="text-xs text-stone-400 mb-3">Follow-ups and result trends for this thread will appear here (coming next)</p>
+    ${timelineHtml}
+  </div>`;
+}
+
+// A lightweight record-detail modal (used from episode view where there's no side panel)
+function renderRecordDetailModal(sel) {
+  const ts = typeStyle(sel.type);
+  return `
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" data-action="deselect-record">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-5 shadow-2xl max-h-[90dvh] overflow-y-auto" onclick="event.stopPropagation()">
+      <div class="flex items-center justify-between mb-4"><p class="font-bold text-stone-900">Record Details</p><button data-action="deselect-record">${iconHtml('x',18,'text-stone-400')}</button></div>
+      <div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-4">${iconHtml(ts.icon,16)}<span>${ts.label}</span></div>
+      <div class="space-y-2.5 text-sm">
+        ${[{l:'Date',v:fmtDate(sel.date)},{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+      </div>
+      ${sel.summary?`<div class="mt-3 p-3 bg-teal-50 rounded-xl"><p class="text-xs font-bold text-teal-700 mb-0.5">Summary</p><p class="text-sm text-teal-800">${esc(sel.summary)}</p></div>`:''}
+      ${sel.extracted?.keyValues?`<div class="mt-3 space-y-1.5">${sel.extracted.keyValues.map(kv=>`<div class="flex items-baseline justify-between px-2 py-1.5 rounded-lg ${kv.status==='critical'?'bg-rose-100':kv.status==='high'||kv.status==='low'?'bg-rose-50':kv.status==='borderline'?'bg-amber-50':'bg-stone-50'}"><span class="text-xs text-stone-500">${esc(kv.name)}</span><span class="text-sm font-bold ${statusColor(kv.status)}">${esc(kv.value)}</span></div>`).join('')}</div>`:''}
+      <div class="mt-4 flex gap-2">
+        <button data-action="file-record" data-id="${sel.id}" class="flex-1 py-2 border border-stone-200 rounded-xl text-xs font-bold text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('git-branch',13)} Change thread</button>
+        <button data-action="delete-record" data-id="${sel.id}" class="flex-1 py-2 border border-rose-200 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-1">${iconHtml('trash-2',13)} Delete</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ─────────────────────────────────────────
+//  EPISODE EDITOR MODAL  (create / edit a thread)
+// ─────────────────────────────────────────
+function renderEpisodeEditor() {
+  const ed = state.episodeEditor;
+  if (!ed) return '';
+  const isEdit = !!ed.id;
+  return `
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="episode-editor-backdrop">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-6 shadow-2xl">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-stone-900 text-lg">${isEdit?'Edit Thread':'New Thread'}</h3>
+        <button data-action="close-episode-editor">${iconHtml('x',18,'text-stone-400')}</button>
+      </div>
+      <div class="space-y-3">
+        <div>
+          <label class="block text-xs font-bold text-stone-500 mb-1">Thread name *</label>
+          <input id="ep-title" value="${esc(ed.title||'')}" placeholder="e.g. Liver Treatment, RHD / Cardiac, Knee Replacement" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/>
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-stone-500 mb-1">Status</label>
+          <div class="flex gap-2">
+            ${['active','monitoring','resolved'].map(s=>`<button data-action="ep-editor-status" data-status="${s}" class="flex-1 py-2 rounded-xl text-xs font-bold border capitalize" style="${(ed.status||'active')===s?`background:${C.teal};color:white;border-color:${C.teal}`:'background:white;color:#78716c;border-color:#e7e5e4'}">${epStatus(s).label}</button>`).join('')}
+          </div>
+          <p class="text-xs text-stone-400 mt-1">Active = ongoing treatment · Monitoring = routine follow-ups · Resolved = closed</p>
+        </div>
+        <div>
+          <label class="block text-xs font-bold text-stone-500 mb-1">Notes (optional)</label>
+          <textarea id="ep-description" rows="2" placeholder="A short note about this thread" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 resize-none">${esc(ed.description||'')}</textarea>
+        </div>
+      </div>
+      <div class="flex gap-3 mt-5">
+        <button data-action="close-episode-editor" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
+        <button id="ep-save" class="flex-1 py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90" style="background:${C.teal}">${isEdit?'Save Changes':'Create Thread'}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ─────────────────────────────────────────
+//  FILE-TO-THREAD MODAL  (assign a record to an episode)
+// ─────────────────────────────────────────
+function renderFileModal() {
+  const fm = state.fileModal;
+  if (!fm) return '';
+  const rec = state.records.find(r => r.id === fm.recordId);
+  if (!rec) return '';
+  return `
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="file-modal-backdrop">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-6 shadow-2xl max-h-[85dvh] flex flex-col">
+      <div class="flex items-center justify-between mb-1 flex-shrink-0">
+        <h3 class="font-bold text-stone-900 text-lg">File to a thread</h3>
+        <button data-action="close-file-modal">${iconHtml('x',18,'text-stone-400')}</button>
+      </div>
+      <p class="text-xs text-stone-400 mb-4 flex-shrink-0 truncate">${esc(rec.title)}</p>
+      <div class="overflow-y-auto flex-1 space-y-2">
+        ${fm.proposedNewTitle ? `
+          <p class="text-xs font-bold text-stone-400 uppercase tracking-wide">Suggested</p>
+          <button data-action="file-to-new" class="w-full flex items-center gap-3 p-3 border-2 border-teal-400 bg-teal-50 rounded-xl text-left">
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('plus',15,'text-white')}</div>
+            <div><p class="font-bold text-stone-900 text-sm">Create "${esc(fm.proposedNewTitle)}"</p><p class="text-xs text-stone-500">New thread</p></div>
+          </button>
+        ` : `
+          <button data-action="file-to-new-blank" class="w-full flex items-center gap-3 p-3 border border-stone-200 rounded-xl text-left hover:bg-stone-50">
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('plus',15,'text-white')}</div>
+            <div><p class="font-bold text-stone-900 text-sm">Create a new thread…</p></div>
+          </button>
+        `}
+        ${state.episodes.length ? `<p class="text-xs font-bold text-stone-400 uppercase tracking-wide pt-2">${fm.proposedMatchId?'Suggested & existing threads':'Existing threads'}</p>` : ''}
+        ${[...state.episodes].sort((a,b) => (b.id===fm.proposedMatchId?1:0)-(a.id===fm.proposedMatchId?1:0)).map(ep => {
+          const isSuggested = ep.id === fm.proposedMatchId;
+          return `
+          <button data-action="file-to-episode" data-id="${ep.id}" class="w-full flex items-center gap-3 p-3 border-2 rounded-xl text-left hover:bg-stone-50 ${isSuggested?'border-teal-400 bg-teal-50':rec.episodeId===ep.id?'border-teal-400 bg-teal-50':'border-stone-200'}">
+            <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${ep.color}1a">${iconHtml('git-branch',15,'')}</div>
+            <div class="flex-1"><p class="font-bold text-stone-900 text-sm">${esc(ep.title)}</p><p class="text-xs text-stone-400">${epStatus(ep.status).label}</p></div>
+            ${isSuggested?badgeHtml('Suggested','bg-teal-100 text-teal-700'):rec.episodeId===ep.id?iconHtml('check-circle',15):''}
+          </button>`;}).join('')}
+        <button data-action="file-to-none" class="w-full flex items-center gap-3 p-3 border border-stone-200 rounded-xl text-left hover:bg-stone-50 text-stone-500">
+          <div class="w-8 h-8 rounded-lg bg-stone-100 flex items-center justify-center flex-shrink-0">${iconHtml('minus',15,'text-stone-400')}</div>
+          <div><p class="font-bold text-sm">No thread</p><p class="text-xs">Keep as a standalone document</p></div>
+        </button>
+      </div>
     </div>
   </div>`;
 }
@@ -1485,6 +1835,57 @@ document.addEventListener('click', async (e) => {
       await handleDeleteRecord(el.dataset.id);
       break;
 
+    // ── Episodes / threads ──
+    case 'records-view':
+      setState({ recordsView: el.dataset.view });
+      break;
+    case 'open-episode':
+      setState({ openEpisodeId: el.dataset.id, recordSelectedId: null });
+      break;
+    case 'close-episode':
+      setState({ openEpisodeId: null });
+      break;
+    case 'new-episode':
+      setState({ episodeEditor: { mid: state.currentId, title: '', status: 'active', description: '' } });
+      break;
+    case 'edit-episode': {
+      const ep = episodeById(el.dataset.id);
+      if (ep) setState({ episodeEditor: { id: ep.id, mid: ep.mid, title: ep.title, status: ep.status, description: ep.description || '' } });
+      break;
+    }
+    case 'close-episode-editor':
+      setState({ episodeEditor: null });
+      break;
+    case 'ep-editor-status':
+      state.episodeEditor.status = el.dataset.status;
+      render();
+      break;
+    case 'delete-episode':
+      await handleDeleteEpisode(el.dataset.id);
+      break;
+    case 'file-record':
+      openFileModal(el.dataset.id);
+      break;
+    case 'close-file-modal':
+      setState({ fileModal: null });
+      break;
+    case 'file-to-episode':
+      await handleFileRecord(state.fileModal.recordId, el.dataset.id);
+      break;
+    case 'file-to-none':
+      await handleFileRecord(state.fileModal.recordId, null);
+      break;
+    case 'file-to-new':
+      await handleFileToNewEpisode(state.fileModal.recordId, state.fileModal.proposedNewTitle);
+      break;
+    case 'file-to-new-blank':
+      // close file modal, open episode editor; after creating, the record stays selected for filing
+      setState({ episodeEditor: { mid: state.currentId, title: '', status: 'active', description: '', fileRecordId: state.fileModal.recordId }, fileModal: null });
+      break;
+    case 'unfile-record':
+      await handleFileRecord(el.dataset.id, null);
+      break;
+
     // ── Health Plan ──
     case 'plan-tab':
       setState({ planTab: el.dataset.tab });
@@ -1517,6 +1918,7 @@ document.addEventListener('click', async (e) => {
   if (e.target.id === 'am-save') handleAddMemberSave();
   if (e.target.id === 'dl-save') handleSaveDailyLog();
   if (e.target.id === 'metric-save') handleSaveMetric();
+  if (e.target.id === 'ep-save') handleSaveEpisode();
   if (e.target.id === 'chat-send') {
     const input = document.getElementById('chat-input');
     if (input && input.value.trim()) { const text = input.value; input.value = ''; sendChatMessage(text); }
@@ -1580,13 +1982,13 @@ function wireUploadModalInputs() {
 //  MEMBER / RECORD / LOG ACTIONS
 // ─────────────────────────────────────────
 async function switchMember(memberId) {
-  setState({ currentId: memberId, records: [], logs: [], metrics: [] });
+  setState({ currentId: memberId, records: [], logs: [], metrics: [], episodes: [], openEpisodeId: null });
   await loadMemberData(memberId);
 }
 async function loadMemberData(memberId) {
   try {
-    const [records, logs, metrics] = await Promise.all([db.getRecords(memberId), db.getLogs(memberId), db.getMetrics(memberId)]);
-    setState({ records, logs, metrics });
+    const [records, logs, metrics, episodes] = await Promise.all([db.getRecords(memberId), db.getLogs(memberId), db.getMetrics(memberId), db.getEpisodes(memberId)]);
+    setState({ records, logs, metrics, episodes });
   } catch (e) { console.error(e); }
 }
 async function handleDeleteRecord(id) {
@@ -1596,6 +1998,77 @@ async function handleDeleteRecord(id) {
     await db.deleteRecord(id);
     setState({ records: state.records.filter(r => r.id !== id), recordDeleting: null, recordSelectedId: state.recordSelectedId === id ? null : state.recordSelectedId });
   } catch { setState({ recordDeleting: null }); }
+}
+
+// ── Episode / filing actions ──
+function openFileModal(recordId) {
+  const rec = state.records.find(r => r.id === recordId);
+  // Simple heuristic proposal: if there's an episode whose title words appear in the record's
+  // title/summary/tags, propose it implicitly by ordering; otherwise propose a new-thread name
+  // derived from the diagnosis or a key tag. (AI-driven proposal comes in the upload flow later.)
+  let proposedNewTitle = '';
+  const dx = rec.extracted?.diagnosis;
+  if (dx && !state.episodes.some(e => e.title.toLowerCase() === dx.toLowerCase())) {
+    proposedNewTitle = dx.length > 40 ? (rec.tags?.[0] || '') : dx;
+  }
+  setState({ fileModal: { recordId, proposedNewTitle }, recordSelectedId: null });
+}
+
+async function handleFileRecord(recordId, episodeId) {
+  try {
+    await db.setRecordEpisode(recordId, episodeId);
+    const records = state.records.map(r => r.id === recordId ? { ...r, episodeId: episodeId || null } : r);
+    setState({ records, fileModal: null });
+    showToast(episodeId ? 'Filed to thread ✓' : 'Removed from thread');
+  } catch (e) { showToast('Could not file — try again'); }
+}
+
+async function handleFileToNewEpisode(recordId, title) {
+  try {
+    const ep = await db.addEpisode(state.session.user.id, { mid: state.currentId, title, status: 'active' });
+    await db.setRecordEpisode(recordId, ep.id);
+    const records = state.records.map(r => r.id === recordId ? { ...r, episodeId: ep.id } : r);
+    setState({ episodes: [ep, ...state.episodes], records, fileModal: null });
+    showToast(`Created "${title}" ✓`);
+  } catch (e) { showToast('Could not create thread — try again'); }
+}
+
+async function handleSaveEpisode() {
+  const ed = state.episodeEditor;
+  const title = document.getElementById('ep-title')?.value.trim();
+  const description = document.getElementById('ep-description')?.value.trim();
+  if (!title) { showToast('Please enter a thread name'); return; }
+  try {
+    if (ed.id) {
+      await db.updateEpisode(ed.id, { title, status: ed.status, description });
+      const episodes = state.episodes.map(e => e.id === ed.id ? { ...e, title, status: ed.status, description } : e);
+      setState({ episodes, episodeEditor: null });
+      showToast('Thread updated ✓');
+    } else {
+      const ep = await db.addEpisode(state.session.user.id, { mid: ed.mid, title, status: ed.status, description });
+      const episodes = [ep, ...state.episodes];
+      // if this editor was opened to file a specific record into the new thread, do that now
+      if (ed.fileRecordId) {
+        await db.setRecordEpisode(ed.fileRecordId, ep.id);
+        const records = state.records.map(r => r.id === ed.fileRecordId ? { ...r, episodeId: ep.id } : r);
+        setState({ episodes, records, episodeEditor: null });
+      } else {
+        setState({ episodes, episodeEditor: null });
+      }
+      showToast(`Created "${title}" ✓`);
+    }
+  } catch (e) { showToast('Could not save — try again'); }
+}
+
+async function handleDeleteEpisode(id) {
+  if (!confirm('Delete this thread? The documents in it will remain, just un-filed.')) return;
+  try {
+    await db.deleteEpisode(id);
+    // records that referenced it become unfiled locally
+    const records = state.records.map(r => r.episodeId === id ? { ...r, episodeId: null } : r);
+    setState({ episodes: state.episodes.filter(e => e.id !== id), records, openEpisodeId: state.openEpisodeId === id ? null : state.openEpisodeId });
+    showToast('Thread deleted');
+  } catch { showToast('Could not delete — try again'); }
 }
 
 // ─────────────────────────────────────────

@@ -13,6 +13,11 @@ const C = {
 };
 const MEMBER_COLORS = ['#0F5B6E', '#7C3AED', '#059669', '#D97706', '#DC2626', '#1A7A93'];
 
+// AI requests go through our Supabase Edge Function (keeps the Anthropic key server-side).
+// Derived automatically from the SUPABASE_URL you set in config.js.
+const AI_ENDPOINT = `${SUPABASE_URL}/functions/v1/ai`;
+const AI_HEADERS = { 'Content-Type': 'application/json', 'Authorization': `Bearer ${SUPABASE_ANON_KEY}`, 'apikey': SUPABASE_ANON_KEY };
+
 // ─────────────────────────────────────────
 //  GLOBAL STATE
 // ─────────────────────────────────────────
@@ -322,8 +327,8 @@ async function analyseDocument(file) {
   const block = isPDF
     ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: b64 } }
     : { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } };
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+  const res = await fetch(AI_ENDPOINT, {
+    method: 'POST', headers: AI_HEADERS,
     body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 2000, messages: [{ role: 'user', content: [block, { type: 'text', text: EXTRACT_PROMPT }] }] })
   });
   if (!res.ok) throw new Error(`AI error (${res.status})`);
@@ -1505,8 +1510,8 @@ Style: Warm, practical, 2-4 short paragraphs max. Plain English. Indian food/bra
   setState({ chatLoading: true });
   scrollChatToBottom();
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
+    const res = await fetch(AI_ENDPOINT, {
+      method: 'POST', headers: AI_HEADERS,
       body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1000, system: SYSTEM, messages: state.chatMsgs.map(x => ({ role: x.role, content: x.content })) })
     });
     const d = await res.json();

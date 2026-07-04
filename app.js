@@ -55,6 +55,7 @@ let state = {
   memberEditor: null,         // { id?, name, role, age, gender, blood, ... } add/edit member modal
   memberSaving: false,
   memberMenuFor: null,        // memberId whose ⋯ menu is open on the Family page
+  movePatientFor: null,       // recordId whose "change patient" picker is open
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -260,6 +261,11 @@ const db = {
   },
   async setRecordEpisode(recordId, episodeId) {
     const { error } = await supabaseClient.from('medical_records').update({ episode_id: episodeId || null }).eq('id', recordId);
+    if (error) throw error;
+  },
+  async setRecordMember(recordId, memberId) {
+    // Moving a record to a different person clears its thread (threads are per-person)
+    const { error } = await supabaseClient.from('medical_records').update({ member_id: memberId, episode_id: null }).eq('id', recordId);
     if (error) throw error;
   },
   // ── Episodes ──
@@ -731,20 +737,25 @@ async function saveUploadRecord(memberId) {
 // Match logic: if the diagnosis/tags/title strongly overlap an existing episode's
 // title, pre-select it; otherwise propose creating a new thread named after the diagnosis.
 function proposeEpisodeForRecord(saved, ext) {
+  // Only consider threads belonging to THIS record's member (threads are per-person)
+  const memberEps = state.allEpisodes.filter(e => e.mid === saved.mid);
   const hay = `${ext.diagnosis || ''} ${(ext.tags || []).join(' ')} ${saved.title || ''}`.toLowerCase();
-  const match = state.episodes.find(ep => {
-    const words = ep.title.toLowerCase().split(/[\s/]+/).filter(w => w.length > 3);
-    return words.some(w => hay.includes(w));
-  });
+  const dx = (ext.diagnosis || '').toLowerCase();
+  // Prefer an exact/name-contained match, then fall back to word overlap
+  let match = memberEps.find(ep => dx && (ep.title.toLowerCase() === dx || hay.includes(ep.title.toLowerCase())));
+  if (!match) {
+    match = memberEps.find(ep => {
+      const words = ep.title.toLowerCase().split(/[\s/]+/).filter(w => w.length > 3);
+      return words.some(w => hay.includes(w));
+    });
+  }
   if (match) {
-    // Pre-file into the matched thread, but still show the modal so the user can confirm/change
     setState({ fileModal: { recordId: saved.id, proposedNewTitle: '', proposedMatchId: match.id } });
   } else {
-    const dx = ext.diagnosis;
+    const dxRaw = ext.diagnosis;
     let proposedNewTitle = '';
-    if (dx) proposedNewTitle = dx.length > 40 ? (ext.tags?.[0] || '') : dx;
-    // Only auto-open the filing modal if we have something to propose or existing threads to pick from
-    if (proposedNewTitle || state.episodes.length) {
+    if (dxRaw) proposedNewTitle = dxRaw.length > 40 ? (ext.tags?.[0] || '') : dxRaw;
+    if (proposedNewTitle || memberEps.length) {
       setState({ fileModal: { recordId: saved.id, proposedNewTitle } });
     }
   }
@@ -1144,7 +1155,7 @@ function renderRecords() {
             <button data-action="records-view" data-view="time" class="px-4 py-1.5 rounded-lg text-xs font-bold transition-colors" style="${isTime?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('calendar',13,'inline mr-1')} By Time</button>
             <button data-action="records-view" data-view="episodes" class="px-4 py-1.5 rounded-lg text-xs font-bold transition-colors" style="${!isTime?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('git-branch',13,'inline mr-1')} By Thread</button>
           </div>
-          ${!isTime?`<button data-action="new-episode" class="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50">${iconHtml('plus',13)} New Thread</button>`:''}
+          ${!isTime?`<button data-action="cleanup-empty-threads" class="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-500 hover:bg-stone-50" title="Remove threads with no documents">${iconHtml('trash-2',13)} Clean up</button><button data-action="new-episode" class="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50">${iconHtml('plus',13)} New Thread</button>`:''}
         </div>
 
         ${isTime ? `
@@ -1259,7 +1270,20 @@ function renderRecordDetailModal(sel) {
 
       <div class="mt-4 flex gap-2">
         <button data-action="file-record" data-id="${sel.id}" class="flex-1 py-2 border border-stone-200 rounded-xl text-xs font-bold text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('git-branch',13)} Change thread</button>
-        <button data-action="delete-record" data-id="${sel.id}" class="flex-1 py-2 border border-rose-200 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-1">${state.recordDeleting===sel.id?spinnerHtml(12):iconHtml('trash-2',13)} Delete</button>
+        <button data-action="move-patient" data-id="${sel.id}" class="flex-1 py-2 border border-stone-200 rounded-xl text-xs font-bold text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('user',13)} Change person</button>
+      </div>
+      ${state.movePatientFor === sel.id ? `<div class="mt-2 p-2 bg-stone-50 rounded-xl">
+        <p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-1.5 px-1">Move to</p>
+        <div class="space-y-1">
+          ${activeMembers().map(mm => `<button data-action="do-move-patient" data-record="${sel.id}" data-member="${mm.id}" class="w-full flex items-center gap-2 p-2 rounded-lg text-left hover:bg-white ${mm.id===sel.mid?'opacity-40 pointer-events-none':''}">
+            <div class="w-6 h-6 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mm.color};font-size:10px;font-weight:800">${mm.avatar}</div>
+            <span class="text-sm font-semibold text-stone-700">${esc(mm.name)}</span>${mm.id===sel.mid?'<span class="text-xs text-stone-400 ml-auto">current</span>':''}
+          </button>`).join('')}
+        </div>
+        <p class="text-xs text-stone-400 px-1 mt-1.5">Note: moving clears its current thread (threads belong to one person).</p>
+      </div>` : ''}
+      <div class="mt-2">
+        <button data-action="delete-record" data-id="${sel.id}" class="w-full py-2 border border-rose-200 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-1">${state.recordDeleting===sel.id?spinnerHtml(12):iconHtml('trash-2',13)} Delete record</button>
       </div>
     </div>
   </div>`;
@@ -1310,8 +1334,11 @@ function renderEpisodeEditor() {
 function renderFileModal() {
   const fm = state.fileModal;
   if (!fm) return '';
-  const rec = state.records.find(r => r.id === fm.recordId);
+  const rec = anyRecord(fm.recordId);
   if (!rec) return '';
+  const owner = memberById(rec.mid);
+  // Threads belong to the record's OWNER — show that person's threads, not the current profile's
+  const memberEpisodes = state.allEpisodes.filter(e => e.mid === rec.mid);
   return `
   <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="file-modal-backdrop">
     <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-6 shadow-2xl max-h-[85dvh] flex flex-col">
@@ -1319,7 +1346,7 @@ function renderFileModal() {
         <h3 class="font-bold text-stone-900 text-lg">File to a thread</h3>
         <button data-action="close-file-modal">${iconHtml('x',18,'text-stone-400')}</button>
       </div>
-      <p class="text-xs text-stone-400 mb-4 flex-shrink-0 truncate">${esc(rec.title)}</p>
+      <p class="text-xs text-stone-400 mb-4 flex-shrink-0 truncate">${esc(rec.title)}${owner?` · ${esc(owner.name.split(' ')[0])}`:''}</p>
       <div class="overflow-y-auto flex-1 space-y-2">
         ${fm.proposedNewTitle ? `
           <p class="text-xs font-bold text-stone-400 uppercase tracking-wide">Suggested</p>
@@ -1332,8 +1359,8 @@ function renderFileModal() {
           <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('plus',15,'text-white')}</div>
           <div><p class="font-bold text-stone-900 text-sm">${fm.proposedNewTitle ? 'Create a different thread…' : 'Create a new thread…'}</p><p class="text-xs text-stone-500">Name it yourself</p></div>
         </button>
-        ${state.episodes.length ? `<p class="text-xs font-bold text-stone-400 uppercase tracking-wide pt-2">${fm.proposedMatchId?'Suggested & existing threads':'Existing threads'}</p>` : ''}
-        ${[...state.episodes].sort((a,b) => (b.id===fm.proposedMatchId?1:0)-(a.id===fm.proposedMatchId?1:0)).map(ep => {
+        ${memberEpisodes.length ? `<p class="text-xs font-bold text-stone-400 uppercase tracking-wide pt-2">${fm.proposedMatchId?'Suggested & existing threads':'Existing threads'}</p>` : ''}
+        ${[...memberEpisodes].sort((a,b) => (b.id===fm.proposedMatchId?1:0)-(a.id===fm.proposedMatchId?1:0)).map(ep => {
           const isSuggested = ep.id === fm.proposedMatchId;
           return `
           <button data-action="file-to-episode" data-id="${ep.id}" class="w-full flex items-center gap-3 p-3 border-2 rounded-xl text-left hover:bg-stone-50 ${isSuggested?'border-teal-400 bg-teal-50':rec.episodeId===ep.id?'border-teal-400 bg-teal-50':'border-stone-200'}">
@@ -1883,19 +1910,23 @@ function renderHeader() {
       <div class="border-t border-stone-100 mt-2 pt-2"><button data-action="goto-close-membermenu" data-page="family" class="w-full flex items-center gap-2 px-3 py-2 text-sm font-bold rounded-xl hover:bg-stone-50" style="color:${C.teal}">${iconHtml('plus',14)} Add Family Member</button></div>
     </div>` : '';
   return `<header class="bg-white border-b border-stone-100 px-4 md:px-5 h-14 flex items-center justify-between flex-shrink-0 z-20">
+    ${state.page === 'records' ? `
+      <div class="flex items-center gap-2">${iconHtml('folder-heart',18,'text-teal-600')}<p class="text-sm font-black text-stone-900">Family Records</p></div>
+    ` : `
     <div class="relative">
       <button data-action="toggle-membermenu" class="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-stone-200 hover:bg-stone-50 transition-colors">
         <div class="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${m.color}">${m.avatar}</div>
-        <div class="text-left hidden sm:block"><p class="text-sm font-black text-stone-900 leading-tight">${esc(m.name)}</p><p class="text-xs text-stone-400 leading-tight">${esc(m.role)} · Score ${m.score}/100</p></div>
+        <div class="text-left hidden sm:block"><p class="text-sm font-black text-stone-900 leading-tight">${esc(m.name)}</p><p class="text-xs text-stone-400 leading-tight">${esc(m.role)}</p></div>
         <p class="text-sm font-black text-stone-900 sm:hidden">${esc(m.name.split(' ')[0])}</p>
         ${iconHtml('chevron-down',13,'text-stone-400')}
       </button>
       ${memberMenuHtml}
     </div>
+    `}
     <div class="flex items-center gap-1">
       <button class="relative p-2.5 rounded-xl hover:bg-stone-50">${iconHtml('bell',18,'text-stone-400')}<span class="absolute top-2 right-2 w-2 h-2 bg-rose-500 rounded-full"></span></button>
-      <button class="p-2.5 rounded-xl hover:bg-stone-50 hidden md:flex">${iconHtml('settings',18,'text-stone-400')}</button>
-      <div class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black ml-1" style="background:${m.color}">${m.avatar}</div>
+      <button data-action="goto" data-page="settings" class="p-2.5 rounded-xl hover:bg-stone-50 hidden md:flex">${iconHtml('settings',18,'text-stone-400')}</button>
+      <button data-action="goto" data-page="settings" class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black ml-1" style="background:${m.color}">${m.avatar}</button>
     </div>
   </header>`;
 }
@@ -2128,6 +2159,15 @@ document.addEventListener('click', async (e) => {
     case 'file-record':
       openFileModal(el.dataset.id);
       break;
+    case 'move-patient':
+      setState({ movePatientFor: state.movePatientFor === el.dataset.id ? null : el.dataset.id });
+      break;
+    case 'do-move-patient':
+      await handleMovePatient(el.dataset.record, el.dataset.member);
+      break;
+    case 'cleanup-empty-threads':
+      await handleCleanupEmptyThreads();
+      break;
     case 'close-file-modal':
       setState({ fileModal: null });
       break;
@@ -2291,6 +2331,29 @@ async function handleViewOriginal(id) {
   }
 }
 
+async function handleMovePatient(recordId, memberId) {
+  try {
+    await db.setRecordMember(recordId, memberId);
+    await loadFamilyData();
+    const mem = memberById(memberId);
+    setState({ movePatientFor: null, recordSelectedId: null, records: state.records.filter(r => r.id !== recordId) });
+    showToast(`Moved to ${mem ? mem.name.split(' ')[0] : 'member'} ✓`);
+  } catch (e) { showToast('Could not move — try again'); }
+}
+
+async function handleCleanupEmptyThreads() {
+  const scope = state.familyFilter ? state.allEpisodes.filter(e => e.mid === state.familyFilter) : state.allEpisodes;
+  const empties = scope.filter(ep => !state.allRecords.some(r => r.episodeId === ep.id));
+  if (empties.length === 0) { showToast('No empty threads to clean'); return; }
+  if (!confirm(`Remove ${empties.length} empty thread${empties.length!==1?'s':''} (no documents)? This can't be undone.`)) return;
+  try {
+    for (const ep of empties) { await db.deleteEpisode(ep.id); }
+    await loadFamilyData();
+    setState({});
+    showToast(`Removed ${empties.length} empty thread${empties.length!==1?'s':''} ✓`);
+  } catch (e) { showToast('Could not clean up — try again'); }
+}
+
 // ── Episode / filing actions ──
 function openFileModal(recordId) {
   const rec = anyRecord(recordId);
@@ -2317,13 +2380,21 @@ async function handleFileRecord(recordId, episodeId) {
 async function handleFileToNewEpisode(recordId, title) {
   try {
     const rec = anyRecord(recordId);
-    const ep = await db.addEpisode(state.session.user.id, { mid: rec?.mid || state.currentId, title, status: 'active' });
-    await db.setRecordEpisode(recordId, ep.id);
+    const mid = rec?.mid || state.currentId;
+    // Dedupe: if a thread with this name already exists for this member, reuse it
+    const existing = state.allEpisodes.find(e => e.mid === mid && e.title.trim().toLowerCase() === title.trim().toLowerCase());
+    let epId;
+    if (existing) {
+      epId = existing.id;
+    } else {
+      const ep = await db.addEpisode(state.session.user.id, { mid, title, status: 'active' });
+      epId = ep.id;
+    }
+    await db.setRecordEpisode(recordId, epId);
     await loadFamilyData();
-    const patch = r => r.id === recordId ? { ...r, episodeId: ep.id } : r;
-    const episodes = rec?.mid === state.currentId ? [ep, ...state.episodes] : state.episodes;
-    setState({ episodes, records: state.records.map(patch), fileModal: null });
-    showToast(`Created "${title}" ✓`);
+    const patch = r => r.id === recordId ? { ...r, episodeId: epId } : r;
+    setState({ records: state.records.map(patch), fileModal: null });
+    showToast(existing ? `Filed to "${title}" ✓` : `Created "${title}" ✓`);
   } catch (e) { showToast('Could not create thread — try again'); }
 }
 

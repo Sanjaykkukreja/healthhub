@@ -1176,8 +1176,8 @@ function renderRecordDetailModal(sel) {
   const ep = sel.episodeId ? episodeById(sel.episodeId) : null;
   const ex = sel.extracted || {};
   return `
-  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" data-action="deselect-record">
-    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-5 shadow-2xl max-h-[90dvh] overflow-y-auto" onclick="event.stopPropagation()">
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="record-detail-backdrop">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-5 shadow-2xl max-h-[90dvh] overflow-y-auto">
       <div class="flex items-center justify-between mb-3"><p class="font-bold text-stone-900">Record Details</p><button data-action="deselect-record">${iconHtml('x',18,'text-stone-400')}</button></div>
 
       ${mem ? `<div class="flex items-center gap-2 mb-3">
@@ -1687,8 +1687,8 @@ function renderBottomNav() {
 
 function renderMoreSheet() {
   if (!state.moreSheetOpen) return '';
-  return `<div class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-end md:hidden" data-action="close-more">
-    <div class="bg-white w-full rounded-t-3xl shadow-2xl p-5" onclick="event.stopPropagation()">
+  return `<div class="fixed inset-0 bg-black/40 backdrop-blur-sm z-50 flex items-end md:hidden" id="more-sheet-backdrop">
+    <div class="bg-white w-full rounded-t-3xl shadow-2xl p-5">
       <div class="w-10 h-1 bg-stone-200 rounded-full mx-auto mb-5"></div>
       <div class="space-y-2">${MOBILE_MORE.map(it => `<button data-action="goto-close-more" data-page="${it.id}" class="w-full flex items-center gap-4 p-3.5 rounded-2xl transition-colors ${state.page===it.id?'text-white':'bg-stone-50 hover:bg-stone-100'}" style="${state.page===it.id?`background:${C.teal}`:''}">
         <div class="w-10 h-10 rounded-xl flex items-center justify-center ${state.page===it.id?'bg-white/20':'bg-white'}">${iconHtml(it.icon,18, state.page===it.id?'text-white':'')}</div>
@@ -1702,7 +1702,7 @@ function renderMoreSheet() {
 function renderHeader() {
   const m = currentMember();
   const memberMenuHtml = state.memberMenuOpen ? `
-    <div class="absolute top-full mt-2 left-0 bg-white rounded-2xl shadow-xl border border-stone-100 p-2 z-50 w-72" onclick="event.stopPropagation()">
+    <div class="absolute top-full mt-2 left-0 bg-white rounded-2xl shadow-xl border border-stone-100 p-2 z-50 w-72">
       <p class="text-xs font-black text-stone-400 uppercase tracking-wider px-3 py-1.5 mb-1">Family Members</p>
       ${state.members.map(mem => `<button data-action="switch-member" data-id="${mem.id}" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-stone-50 transition-colors ${state.currentId===mem.id?'bg-teal-50':''}">
         <div class="w-9 h-9 rounded-full flex items-center justify-center text-white font-black text-sm flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div>
@@ -1712,7 +1712,7 @@ function renderHeader() {
       <div class="border-t border-stone-100 mt-2 pt-2"><button data-action="goto-close-membermenu" data-page="family" class="w-full flex items-center gap-2 px-3 py-2 text-sm font-bold rounded-xl hover:bg-stone-50" style="color:${C.teal}">${iconHtml('plus',14)} Add Family Member</button></div>
     </div>` : '';
   return `<header class="bg-white border-b border-stone-100 px-4 md:px-5 h-14 flex items-center justify-between flex-shrink-0 z-20">
-    <div class="relative" onclick="event.stopPropagation()">
+    <div class="relative">
       <button data-action="toggle-membermenu" class="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-stone-200 hover:bg-stone-50 transition-colors">
         <div class="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${m.color}">${m.avatar}</div>
         <div class="text-left hidden sm:block"><p class="text-sm font-black text-stone-900 leading-tight">${esc(m.name)}</p><p class="text-xs text-stone-400 leading-tight">${esc(m.role)} · Score ${m.score}/100</p></div>
@@ -1798,6 +1798,11 @@ function mountChartsForCurrentPage() {
 //  EVENT DELEGATION  (single listener handles all clicks)
 // ─────────────────────────────────────────
 document.addEventListener('click', async (e) => {
+  // Outside-click-to-close for modals that use the backdrop-id pattern
+  // (clicking the backdrop itself closes; clicks on inner content don't reach here)
+  if (e.target.id === 'record-detail-backdrop') { setState({ recordSelectedId: null }); return; }
+  if (e.target.id === 'more-sheet-backdrop') { setState({ moreSheetOpen: false }); return; }
+
   const el = e.target.closest('[data-action]');
   if (!el) {
     // close dropdowns when clicking outside

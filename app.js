@@ -30,7 +30,7 @@ let state = {
   records: [],
   logs: [],
   metrics: [],
-  page: 'dashboard',
+  page: 'records',
   sidebarOpen: true,
   memberMenuOpen: false,
   moreSheetOpen: false,
@@ -49,7 +49,7 @@ let state = {
   episodes: [],
   allRecords: [],             // family-wide records (all members) for the Records page
   allEpisodes: [],            // family-wide episodes
-  familyFilter: null,         // null = whole family; or a memberId to filter Records to one person
+  familyView: true,           // true = Whole Family (all pages); false = the single member in currentId
   lastUploadMemberId: null,   // remembers who the previous upload was filed to (default for next)
   uploadTargetId: null,       // the member selected in the upload "who is this for?" step
   memberEditor: null,         // { id?, name, role, age, gender, blood, ... } add/edit member modal
@@ -994,14 +994,15 @@ function renderRecords() {
   // When a single episode is open, show its detail view instead of the list.
   if (state.openEpisodeId) return renderEpisodeDetail();
   const m = currentMember();
-  // Family-first: source from ALL records, filtered to a person only if a filter is set
-  const baseRecords = state.familyFilter ? state.allRecords.filter(r => r.mid === state.familyFilter) : state.allRecords;
+  // Single control: Whole Family shows everyone; otherwise the selected member
+  const scopeId = state.familyView ? null : state.currentId;
+  const baseRecords = scopeId ? state.allRecords.filter(r => r.mid === scopeId) : state.allRecords;
   const filtered = baseRecords.filter(r =>
     (state.recordFilter === 'all' || r.type === state.recordFilter) &&
     (!state.recordSearch || r.title?.toLowerCase().includes(state.recordSearch.toLowerCase()) || r.summary?.toLowerCase().includes(state.recordSearch.toLowerCase()))
   );
   const sel = state.allRecords.find(r => r.id === state.recordSelectedId);
-  const filterName = state.familyFilter ? (memberById(state.familyFilter)?.name || '') : 'Whole family';
+  const filterName = scopeId ? (memberById(scopeId)?.name || '') : 'Whole family';
 
   const listHtml = filtered.length === 0 ? `
     <div class="text-center py-16 text-stone-400">
@@ -1109,7 +1110,7 @@ function renderRecords() {
       </div>`).join('');
 
   // Episodes view: list of threads for this member
-  const baseEpisodes = state.familyFilter ? state.allEpisodes.filter(e => e.mid === state.familyFilter) : state.allEpisodes;
+  const baseEpisodes = scopeId ? state.allEpisodes.filter(e => e.mid === scopeId) : state.allEpisodes;
   const episodesListHtml = baseEpisodes.length === 0
     ? `<div class="text-center py-16 text-stone-400">${iconHtml('git-branch',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No threads yet</p><p class="text-sm mt-1">Group related documents into a health thread — e.g. "Liver Treatment" or "RHD / Cardiac"</p><button data-action="new-episode" class="mt-4 px-5 py-2.5 text-white rounded-xl text-sm font-bold inline-flex items-center gap-2 hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Create First Thread</button></div>`
     : `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">${baseEpisodes.map(ep => {
@@ -1130,11 +1131,6 @@ function renderRecords() {
       }).join('')}</div>`;
 
   const isTime = state.recordsView === 'time';
-  // person filter chips (All + each active member)
-  const personChips = `<div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
-    <button data-action="family-filter" data-id="all" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap flex-shrink-0 transition-colors" style="${!state.familyFilter?`background:${C.teal};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}">${iconHtml('users',12,'inline')} All</button>
-    ${activeMembers().map(mem => `<button data-action="family-filter" data-id="${mem.id}" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap flex-shrink-0 transition-colors" style="${state.familyFilter===mem.id?`background:${mem.color};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}"><span class="w-4 h-4 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${state.familyFilter===mem.id?'rgba(255,255,255,0.3)':mem.color};font-size:9px;font-weight:800">${mem.avatar}</span>${esc(mem.name.split(' ')[0])}</button>`).join('')}
-  </div>`;
 
   return `
   <div class="fade-in">
@@ -1146,16 +1142,13 @@ function renderRecords() {
           <button data-action="open-upload" class="flex items-center gap-2 px-4 py-2.5 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('upload',15)}<span class="hidden sm:inline">Upload Record</span><span class="sm:hidden">Upload</span></button>
         </div>
 
-        <!-- Person filter (family-first) -->
-        ${personChips}
-
         <!-- Time / Episodes toggle -->
         <div class="flex items-center gap-2">
           <div class="inline-flex bg-stone-100 rounded-xl p-1">
             <button data-action="records-view" data-view="time" class="px-4 py-1.5 rounded-lg text-xs font-bold transition-colors" style="${isTime?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('calendar',13,'inline mr-1')} By Time</button>
             <button data-action="records-view" data-view="episodes" class="px-4 py-1.5 rounded-lg text-xs font-bold transition-colors" style="${!isTime?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('git-branch',13,'inline mr-1')} By Thread</button>
           </div>
-          ${!isTime?`<button data-action="cleanup-empty-threads" class="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-500 hover:bg-stone-50" title="Remove threads with no documents">${iconHtml('trash-2',13)} Clean up</button><button data-action="new-episode" class="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50">${iconHtml('plus',13)} New Thread</button>`:''}
+          ${!isTime?`<button data-action="new-episode" class="ml-auto flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50">${iconHtml('plus',13)} New Thread</button>`:''}
         </div>
 
         ${isTime ? `
@@ -1899,39 +1892,48 @@ function renderMoreSheet() {
 
 function renderHeader() {
   const m = currentMember();
+  const label = state.familyView ? 'Whole Family' : (m ? m.name : '');
+  const sublabel = state.familyView ? `${activeMembers().length} members` : (m ? m.role : '');
   const memberMenuHtml = state.memberMenuOpen ? `
     <div class="absolute top-full mt-2 left-0 bg-white rounded-2xl shadow-xl border border-stone-100 p-2 z-50 w-72">
-      <p class="text-xs font-black text-stone-400 uppercase tracking-wider px-3 py-1.5 mb-1">Family Members</p>
-      ${state.members.map(mem => `<button data-action="switch-member" data-id="${mem.id}" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-stone-50 transition-colors ${state.currentId===mem.id?'bg-teal-50':''}">
+      <button data-action="view-family" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-stone-50 transition-colors ${state.familyView?'bg-teal-50':''}">
+        <div class="w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml('users',18,'')}</div>
+        <div class="flex-1 text-left"><p class="text-sm font-bold text-stone-900">Whole Family</p><p class="text-xs text-stone-400">Everyone together</p></div>
+        ${state.familyView?iconHtml('check-circle',15):''}
+      </button>
+      <div class="border-t border-stone-100 my-1"></div>
+      <p class="text-xs font-black text-stone-400 uppercase tracking-wider px-3 py-1.5">Individuals</p>
+      ${activeMembers().map(mem => `<button data-action="switch-member" data-id="${mem.id}" class="w-full flex items-center gap-3 px-3 py-2.5 rounded-xl hover:bg-stone-50 transition-colors ${!state.familyView && state.currentId===mem.id?'bg-teal-50':''}">
         <div class="w-9 h-9 rounded-full flex items-center justify-center text-white font-black text-sm flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div>
-        <div class="flex-1 text-left"><p class="text-sm font-bold text-stone-900">${esc(mem.name)}</p><p class="text-xs text-stone-400">${esc(mem.role)} · ${mem.age||'?'}y · Score ${mem.score}</p></div>
-        ${state.currentId===mem.id?iconHtml('check-circle',15):''}
+        <div class="flex-1 text-left"><p class="text-sm font-bold text-stone-900">${esc(mem.name)}</p><p class="text-xs text-stone-400">${esc(mem.role)}${mem.age?` · ${mem.age}y`:''}</p></div>
+        ${!state.familyView && state.currentId===mem.id?iconHtml('check-circle',15):''}
       </button>`).join('')}
-      <div class="border-t border-stone-100 mt-2 pt-2"><button data-action="goto-close-membermenu" data-page="family" class="w-full flex items-center gap-2 px-3 py-2 text-sm font-bold rounded-xl hover:bg-stone-50" style="color:${C.teal}">${iconHtml('plus',14)} Add Family Member</button></div>
+      <div class="border-t border-stone-100 mt-2 pt-2"><button data-action="open-member-add" class="w-full flex items-center gap-2 px-3 py-2 text-sm font-bold rounded-xl hover:bg-stone-50" style="color:${C.teal}">${iconHtml('plus',14)} Add Family Member</button></div>
     </div>` : '';
   return `<header class="bg-white border-b border-stone-100 px-4 md:px-5 h-14 flex items-center justify-between flex-shrink-0 z-20">
-    ${state.page === 'records' ? `
-      <div class="flex items-center gap-2">${iconHtml('folder-heart',18,'text-teal-600')}<p class="text-sm font-black text-stone-900">Family Records</p></div>
-    ` : `
     <div class="relative">
       <button data-action="toggle-membermenu" class="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border border-stone-200 hover:bg-stone-50 transition-colors">
-        <div class="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${m.color}">${m.avatar}</div>
-        <div class="text-left hidden sm:block"><p class="text-sm font-black text-stone-900 leading-tight">${esc(m.name)}</p><p class="text-xs text-stone-400 leading-tight">${esc(m.role)}</p></div>
-        <p class="text-sm font-black text-stone-900 sm:hidden">${esc(m.name.split(' ')[0])}</p>
+        <div class="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${state.familyView?C.teal:(m?m.color:C.teal)}">${state.familyView?iconHtml('users',14,'text-white'):(m?m.avatar:'?')}</div>
+        <div class="text-left hidden sm:block"><p class="text-sm font-black text-stone-900 leading-tight">${esc(label)}</p><p class="text-xs text-stone-400 leading-tight">${esc(sublabel)}</p></div>
+        <p class="text-sm font-black text-stone-900 sm:hidden">${esc(state.familyView?'Family':label.split(' ')[0])}</p>
         ${iconHtml('chevron-down',13,'text-stone-400')}
       </button>
       ${memberMenuHtml}
     </div>
-    `}
     <div class="flex items-center gap-1">
       <button class="relative p-2.5 rounded-xl hover:bg-stone-50">${iconHtml('bell',18,'text-stone-400')}<span class="absolute top-2 right-2 w-2 h-2 bg-rose-500 rounded-full"></span></button>
       <button data-action="goto" data-page="settings" class="p-2.5 rounded-xl hover:bg-stone-50 hidden md:flex">${iconHtml('settings',18,'text-stone-400')}</button>
-      <button data-action="goto" data-page="settings" class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black ml-1" style="background:${m.color}">${m.avatar}</button>
+      <button data-action="goto" data-page="settings" class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black ml-1" style="background:${C.teal}">${esc((state.session?.user?.email?.[0]||'S').toUpperCase())}</button>
     </div>
   </header>`;
 }
 
 function renderPageContent() {
+  // Per-person pages need a selected member. In Whole-Family view, prompt to pick one (Option A).
+  const perPersonPages = ['dashboard', 'healthplan', 'dailylog', 'metrics'];
+  if (state.familyView && perPersonPages.includes(state.page)) {
+    return renderPickPerson();
+  }
   switch (state.page) {
     case 'dashboard': return renderDashboard();
     case 'records': return renderRecords();
@@ -1944,6 +1946,22 @@ function renderPageContent() {
     case 'settings': return renderSettings();
     default: return renderDashboard();
   }
+}
+
+function renderPickPerson() {
+  const pageLabel = { dashboard: 'Dashboard', healthplan: 'Health Plan', dailylog: 'Daily Log', metrics: 'Metrics' }[state.page] || 'This view';
+  return `<div class="fade-in max-w-md mx-auto pt-8 text-center">
+    <div class="w-14 h-14 rounded-2xl mx-auto flex items-center justify-center mb-4" style="background:${C.teal}1a">${iconHtml('users',26,'')}</div>
+    <h1 class="text-xl font-bold text-stone-900">${pageLabel} is per person</h1>
+    <p class="text-sm text-stone-500 mt-1 mb-6">You're viewing the whole family. Pick a person to see their ${pageLabel.toLowerCase()}.</p>
+    <div class="space-y-2 text-left">
+      ${activeMembers().map(mem => `<button data-action="pick-person" data-id="${mem.id}" class="w-full flex items-center gap-3 p-3 bg-white border border-stone-100 rounded-2xl shadow-sm hover:shadow-md transition-all">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center text-white font-black flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div>
+        <div class="flex-1 text-left"><p class="font-bold text-stone-900 text-sm">${esc(mem.name)}</p><p class="text-xs text-stone-400">${esc(mem.role)}${mem.age?` · ${mem.age}y`:''}</p></div>
+        ${iconHtml('chevron-right',16,'text-stone-300')}
+      </button>`).join('')}
+    </div>
+  </div>`;
 }
 
 function renderMainApp() {
@@ -2034,8 +2052,17 @@ document.addEventListener('click', async (e) => {
       setState({ memberMenuOpen: !state.memberMenuOpen });
       break;
     case 'switch-member':
+      state.familyView = false;
       await switchMember(el.dataset.id);
-      setState({ memberMenuOpen: false, page: 'dashboard' });
+      setState({ memberMenuOpen: false });
+      break;
+    case 'view-family':
+      setState({ familyView: true, memberMenuOpen: false });
+      break;
+    case 'pick-person':
+      state.familyView = false;
+      await switchMember(el.dataset.id);
+      setState({ memberMenuOpen: false });
       break;
     case 'open-more':
       setState({ moreSheetOpen: true });
@@ -2080,7 +2107,9 @@ document.addEventListener('click', async (e) => {
       await handleDeleteMember(el.dataset.id);
       break;
     case 'view-member-records':
-      setState({ familyFilter: el.dataset.id, page: 'records', memberMenuFor: null, recordsView: 'time' });
+      state.familyView = false;
+      await switchMember(el.dataset.id);
+      setState({ page: 'records', memberMenuFor: null, recordsView: 'time' });
       break;
 
     // ── Upload Modal ──
@@ -2107,9 +2136,6 @@ document.addEventListener('click', async (e) => {
       setState({ memberEditor: { name: detected, role: 'Family', gender: 'Female', fromUpload: true } });
       break;
     }
-    case 'family-filter':
-      setState({ familyFilter: el.dataset.id === 'all' ? null : el.dataset.id, recordSelectedId: null, openEpisodeId: null });
-      break;
 
     // ── Records ──
     case 'select-record':
@@ -2131,6 +2157,7 @@ document.addEventListener('click', async (e) => {
     // ── Episodes / threads ──
     case 'records-view':
       setState({ recordsView: el.dataset.view });
+      if (el.dataset.view === 'episodes') { silentCleanupEmptyThreads(); }
       break;
     case 'open-episode':
       setState({ openEpisodeId: el.dataset.id, recordSelectedId: null });
@@ -2139,7 +2166,7 @@ document.addEventListener('click', async (e) => {
       setState({ openEpisodeId: null });
       break;
     case 'new-episode':
-      setState({ episodeEditor: { mid: state.familyFilter || state.currentId, title: '', status: 'active', description: '' } });
+      setState({ episodeEditor: { mid: (!state.familyView && state.currentId) || state.currentId, title: '', status: 'active', description: '' } });
       break;
     case 'edit-episode': {
       const ep = episodeById(el.dataset.id);
@@ -2164,9 +2191,6 @@ document.addEventListener('click', async (e) => {
       break;
     case 'do-move-patient':
       await handleMovePatient(el.dataset.record, el.dataset.member);
-      break;
-    case 'cleanup-empty-threads':
-      await handleCleanupEmptyThreads();
       break;
     case 'close-file-modal':
       setState({ fileModal: null });
@@ -2341,17 +2365,17 @@ async function handleMovePatient(recordId, memberId) {
   } catch (e) { showToast('Could not move — try again'); }
 }
 
-async function handleCleanupEmptyThreads() {
-  const scope = state.familyFilter ? state.allEpisodes.filter(e => e.mid === state.familyFilter) : state.allEpisodes;
-  const empties = scope.filter(ep => !state.allRecords.some(r => r.episodeId === ep.id));
-  if (empties.length === 0) { showToast('No empty threads to clean'); return; }
-  if (!confirm(`Remove ${empties.length} empty thread${empties.length!==1?'s':''} (no documents)? This can't be undone.`)) return;
+// Silently remove empty (0-document) threads. Runs automatically when you ENTER the thread view,
+// so leftover/duplicate empty threads clear themselves. A thread you create while already in the
+// thread view stays until you navigate away and back (giving you time to file documents into it).
+async function silentCleanupEmptyThreads() {
+  const empties = state.allEpisodes.filter(ep => !state.allRecords.some(r => r.episodeId === ep.id));
+  if (empties.length === 0) return;
   try {
     for (const ep of empties) { await db.deleteEpisode(ep.id); }
     await loadFamilyData();
     setState({});
-    showToast(`Removed ${empties.length} empty thread${empties.length!==1?'s':''} ✓`);
-  } catch (e) { showToast('Could not clean up — try again'); }
+  } catch (e) { /* silent — cleanup is best-effort */ }
 }
 
 // ── Episode / filing actions ──
@@ -2476,7 +2500,7 @@ async function handleArchiveMember(id, archived) {
     await reloadMembers();
     // If we archived the active/filter member, reset
     const patch = {};
-    if (archived && state.familyFilter === id) patch.familyFilter = null;
+    if (archived && !state.familyView && state.currentId === id) patch.familyView = true;
     if (archived && state.currentId === id) { const first = activeMembers()[0]; if (first) { await switchMember(first.id); } }
     setState({ memberMenuFor: null, ...patch });
     showToast(archived ? 'Member hidden' : 'Member unhidden');
@@ -2492,7 +2516,7 @@ async function handleDeleteMember(id) {
     await db.deleteMember(id);
     await Promise.all([reloadMembers(), loadFamilyData()]);
     const patch = { memberMenuFor: null };
-    if (state.familyFilter === id) patch.familyFilter = null;
+    if (!state.familyView && state.currentId === id) patch.familyView = true;
     if (state.currentId === id) { const first = activeMembers()[0]; if (first) { await switchMember(first.id); } }
     setState(patch);
     showToast(`${mem.name} deleted`);

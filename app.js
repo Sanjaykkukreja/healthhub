@@ -47,6 +47,14 @@ let state = {
   recordDeleting: null,
   recordsView: 'time',        // 'time' (month/year timeline) | 'episodes' (thread list)
   episodes: [],
+  allRecords: [],             // family-wide records (all members) for the Records page
+  allEpisodes: [],            // family-wide episodes
+  familyFilter: null,         // null = whole family; or a memberId to filter Records to one person
+  lastUploadMemberId: null,   // remembers who the previous upload was filed to (default for next)
+  uploadTargetId: null,       // the member selected in the upload "who is this for?" step
+  memberEditor: null,         // { id?, name, role, age, gender, blood, ... } add/edit member modal
+  memberSaving: false,
+  memberMenuFor: null,        // memberId whose ⋯ menu is open on the Family page
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -169,6 +177,43 @@ const db = {
       conditions: r.conditions || [], medications: r.medications || [],
       allergies: r.allergies || [], goals: r.goals || [], family: r.family_history || [],
       doctor: r.doctor, hospital: r.hospital, nextVisit: r.next_visit, insurance: r.insurance,
+      archived: r.archived || false,
+    }));
+  },
+  async updateMember(memberId, patch) {
+    const upd = {};
+    const map = { name:'name', role:'role', age:'age', gender:'gender', blood:'blood_group',
+      height:'height', weight:'weight', bp:'bp', hba1c:'hba1c', vd:'vitamin_d', bmi:'bmi',
+      doctor:'doctor', hospital:'hospital', insurance:'insurance', archived:'archived',
+      conditions:'conditions', medications:'medications', allergies:'allergies', goals:'goals' };
+    for (const k in patch) if (map[k]) upd[map[k]] = patch[k];
+    const { error } = await supabaseClient.from('family_members').update(upd).eq('id', memberId);
+    if (error) throw error;
+  },
+  async deleteMember(memberId) {
+    // records, episodes, followups, lab_values referencing this member cascade-delete via FK.
+    const { error } = await supabaseClient.from('family_members').delete().eq('id', memberId);
+    if (error) throw error;
+  },
+  async getAllRecords(userId) {
+    const { data, error } = await supabaseClient.from('medical_records').select('*').eq('owner_id', userId).order('date', { ascending: false });
+    if (error) throw error;
+    return data.map(r => ({
+      id: r.id, mid: r.member_id, date: r.date, type: r.type, title: r.title,
+      doctor: r.doctor, hospital: r.hospital, amount: r.amount, summary: r.summary,
+      tags: r.tags || [], priority: r.priority || 'medium', source: r.source || 'manual',
+      uploadedFile: r.uploaded_file_name, filePath: r.file_path,
+      patientNameOnDoc: r.patient_name_on_doc, extracted: r.extracted_data || {},
+      episodeId: r.episode_id || null,
+    }));
+  },
+  async getAllEpisodes(userId) {
+    const { data, error } = await supabaseClient.from('episodes').select('*').eq('owner_id', userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    return data.map(e => ({
+      id: e.id, mid: e.member_id, title: e.title, category: e.category,
+      status: e.status || 'active', description: e.description,
+      startedOn: e.started_on, color: e.color || C.teal,
     }));
   },
   async addMember(userId, data) {
@@ -629,12 +674,14 @@ async function runUploadAnalysis(file) {
   try {
     const extracted = await analyseDocument(file);
     clearInterval(tick);
-    const m = currentMember();
-    if (extracted.patientName && !nameMatches(extracted.patientName, m.name)) {
-      setState({ uploadModal: { ...state.uploadModal, phase: 'mismatch', ext: extracted, pct: 100, mismatchName: extracted.patientName } });
-    } else {
-      setState({ uploadModal: { ...state.uploadModal, phase: 'review', ext: extracted, pct: 100 } });
+    // Smart default for "who is this for?": AI name match → last-used member → current
+    let targetId = state.lastUploadMemberId || state.currentId;
+    let aiMatchId = null;
+    if (extracted.patientName) {
+      const match = state.members.find(mm => nameMatches(extracted.patientName, mm.name));
+      if (match) { aiMatchId = match.id; targetId = match.id; }
     }
+    setState({ uploadModal: { ...state.uploadModal, phase: 'review', ext: extracted, pct: 100, aiMatchId }, uploadTargetId: targetId });
   } catch (e) {
     clearInterval(tick);
     setState({ uploadModal: { ...state.uploadModal, phase: 'error', errMsg: e.message || 'Upload failed' } });
@@ -665,8 +712,12 @@ async function saveUploadRecord(memberId) {
       }
     };
     const saved = await db.addRecord(state.session.user.id, rec);
-    // Switch to the member the doc was filed under, so its episodes are in context
+    // Remember this member as the default for the next upload
+    state.lastUploadMemberId = memberId;
+    // Switch active profile to the filed member so its episodes are in context for threading
     if (memberId !== state.currentId) { await switchMember(memberId); }
+    // Refresh family-wide records so the Records page shows the new doc immediately
+    await loadFamilyData();
     setState({ records: [saved, ...state.records.filter(r => r.id !== saved.id)], uploadModal: null });
     showToast(`"${saved.title}" saved ✓`);
     // AI proposes a thread: match against existing episodes, else propose new from diagnosis
@@ -737,32 +788,6 @@ function renderUploadModal() {
         <div class="w-full bg-stone-100 rounded-full h-2 overflow-hidden"><div id="upload-progress-bar" class="h-2 rounded-full transition-all duration-700" style="width:${um.pct}%;background:${C.teal}"></div></div>
         ${um.file ? `<div class="flex items-center gap-2 px-3 py-2 bg-stone-50 rounded-xl text-xs text-stone-500 w-full">${iconHtml('file-text',13)}<span class="truncate flex-1">${esc(um.file.name)}</span><span>${(um.file.size/1024).toFixed(0)} KB</span></div>` : ''}
       </div>`;
-  } else if (um.phase === 'mismatch') {
-    const ext = um.ext;
-    body = `
-      <div class="space-y-4">
-        <div class="p-4 bg-amber-50 border border-amber-200 rounded-2xl">
-          <div class="flex items-start gap-3">${iconHtml('alert-triangle',20,'text-amber-500')}
-            <div>
-              <p class="font-bold text-amber-900 text-sm">Different patient name on document</p>
-              <p class="text-sm text-amber-800 mt-1">Document shows: <strong>"${esc(um.mismatchName)}"</strong></p>
-              <p class="text-sm text-amber-700">Current profile: <strong>"${esc(m.name)}"</strong></p>
-              <p class="text-xs text-amber-600 mt-2">This may be a family member's record. Choose who to add it to:</p>
-            </div>
-          </div>
-        </div>
-        ${ext ? `<div class="p-3 bg-stone-50 rounded-xl"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-1">Document</p>${ext.title?`<p class="font-semibold text-stone-800 text-sm">${esc(ext.title)}</p>`:''}${ext.summary?`<p class="text-xs text-stone-500 mt-1">${esc(ext.summary)}</p>`:''}</div>` : ''}
-        <div class="space-y-2">
-          ${state.members.map(mem => `
-            <button data-action="save-upload" data-member-id="${mem.id}" ${um.uploading?'disabled':''}
-              class="w-full flex items-center gap-3 p-3.5 border-2 rounded-2xl transition-colors text-left ${mem.id===m.id?'border-teal-400 bg-teal-50':'border-stone-200 bg-white hover:border-stone-300'}">
-              <div class="w-9 h-9 rounded-full flex items-center justify-center text-white font-black text-sm flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div>
-              <div class="flex-1"><p class="font-bold text-stone-900 text-sm">${esc(mem.name)}</p><p class="text-xs text-stone-400">${esc(mem.role)}</p></div>
-              ${um.uploading && mem.id===m.id ? spinnerHtml(15) : mem.id===m.id ? iconHtml('check-circle',15) : ''}
-            </button>`).join('')}
-          <button data-action="close-upload" class="w-full py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-400">Cancel – this file doesn't belong here</button>
-        </div>
-      </div>`;
   } else if (um.phase === 'review') {
     const ext = um.ext;
     const infoRows = [
@@ -776,6 +801,21 @@ function renderUploadModal() {
           ${iconHtml('check-circle',15,'text-emerald-600')}<p class="text-sm font-bold text-emerald-800">AI extraction complete</p>
           ${um.file ? `<span class="ml-auto text-xs text-stone-400 truncate max-w-36">${esc(um.file.name)}</span>` : ''}
         </div>
+
+        <!-- WHO IS THIS FOR? -->
+        <div class="p-3 bg-white border-2 border-teal-200 rounded-2xl">
+          <div class="flex items-center gap-1.5 mb-2">${iconHtml('user',13,'text-teal-600')}<p class="text-xs font-bold text-stone-700 uppercase tracking-wide">Who is this for?</p></div>
+          ${um.ext.patientName ? `<p class="text-xs text-stone-400 mb-2">Document shows: <span class="font-semibold text-stone-600">${esc(um.ext.patientName)}</span>${um.aiMatchId?' · matched automatically':''}</p>` : ''}
+          <div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
+            ${activeMembers().map(mem => `<button data-action="set-upload-target" data-id="${mem.id}" class="flex items-center gap-2 px-3 py-2 rounded-xl border-2 whitespace-nowrap flex-shrink-0 ${state.uploadTargetId===mem.id?'border-teal-400 bg-teal-50':'border-stone-200 bg-white'}">
+              <div class="w-6 h-6 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:10px;font-weight:800">${mem.avatar}</div>
+              <span class="text-sm font-bold text-stone-800">${esc(mem.name.split(' ')[0])}</span>
+              ${state.uploadTargetId===mem.id?iconHtml('check',13,'text-teal-600'):''}
+            </button>`).join('')}
+            <button data-action="upload-add-member" class="flex items-center gap-1.5 px-3 py-2 rounded-xl border-2 border-dashed border-stone-300 text-stone-500 whitespace-nowrap flex-shrink-0">${iconHtml('plus',13)} <span class="text-sm font-bold">Add ${um.ext.patientName?esc(um.ext.patientName.split(' ')[0]):'member'}</span></button>
+          </div>
+        </div>
+
         <div class="grid grid-cols-2 gap-2.5">
           ${infoRows.map(x=>`<div class="bg-stone-50 rounded-xl p-2.5"><p class="text-xs text-stone-400">${x.l}</p><p class="text-sm font-semibold text-stone-800 mt-0.5 capitalize">${esc(x.v)}</p></div>`).join('')}
         </div>
@@ -793,9 +833,9 @@ function renderUploadModal() {
           </div>`).join('')}</div></div>`:''}
         <div class="flex gap-3 pt-1">
           <button data-action="close-upload" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
-          <button data-action="save-upload" data-member-id="${m.id}" ${um.uploading?'disabled':''}
+          <button data-action="save-upload" data-member-id="${state.uploadTargetId||''}" ${um.uploading||!state.uploadTargetId?'disabled':''}
             class="flex-1 py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">
-            ${um.uploading?spinnerHtml(15,'text-white'):''} ${um.uploading?'Saving…':`Save to ${esc(m.name.split(' ')[0])}'s Records`}
+            ${um.uploading?spinnerHtml(15,'text-white'):''} ${um.uploading?'Saving…':(() => { const t = state.members.find(x=>x.id===state.uploadTargetId); return t?`Save to ${esc(t.name.split(' ')[0])}`:'Select a person'; })()}
           </button>
         </div>
       </div>`;
@@ -820,7 +860,7 @@ function renderUploadModal() {
       <div class="flex items-center justify-between px-5 pt-5 pb-4 border-b border-stone-100 flex-shrink-0">
         <div class="flex items-center gap-3">
           <div class="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('upload',16,'text-white')}</div>
-          <div><p class="font-bold text-stone-900 text-sm">Upload Medical Record</p><p class="text-xs text-stone-400">Adding to <span class="font-semibold">${esc(m.name)}</span></p></div>
+          <div><p class="font-bold text-stone-900 text-sm">Upload Medical Record</p><p class="text-xs text-stone-400">AI reads it, then you choose who it's for</p></div>
         </div>
         <button data-action="close-upload" class="p-2 rounded-xl hover:bg-stone-100">${iconHtml('x',18,'text-stone-400')}</button>
       </div>
@@ -833,6 +873,8 @@ function renderUploadModal() {
 //  HELPERS
 // ─────────────────────────────────────────
 function currentMember() { return state.members.find(x => x.id === state.currentId); }
+function activeMembers() { return state.members.filter(x => !x.archived); }
+function memberById(id) { return state.members.find(x => x.id === id); }
 
 // ─────────────────────────────────────────
 //  DASHBOARD
@@ -911,7 +953,7 @@ function mountDashboardCharts() {
 const RECORD_TABS = [{id:'all',label:'All'},{id:'prescription',label:'Prescriptions'},{id:'report',label:'Reports'},{id:'bill',label:'Bills'},{id:'xray',label:'X-Rays'},{id:'discharge',label:'Discharge'}];
 
 // ── Episode helpers ──
-function episodeById(id) { return state.episodes.find(e => e.id === id); }
+function episodeById(id) { return state.allEpisodes.find(e => e.id === id) || state.episodes.find(e => e.id === id); }
 const EP_STATUS = {
   active:     { label: 'Active',     cls: 'bg-teal-50 text-teal-700' },
   monitoring: { label: 'Monitoring', cls: 'bg-amber-50 text-amber-700' },
@@ -941,11 +983,14 @@ function renderRecords() {
   // When a single episode is open, show its detail view instead of the list.
   if (state.openEpisodeId) return renderEpisodeDetail();
   const m = currentMember();
-  const filtered = state.records.filter(r =>
+  // Family-first: source from ALL records, filtered to a person only if a filter is set
+  const baseRecords = state.familyFilter ? state.allRecords.filter(r => r.mid === state.familyFilter) : state.allRecords;
+  const filtered = baseRecords.filter(r =>
     (state.recordFilter === 'all' || r.type === state.recordFilter) &&
     (!state.recordSearch || r.title?.toLowerCase().includes(state.recordSearch.toLowerCase()) || r.summary?.toLowerCase().includes(state.recordSearch.toLowerCase()))
   );
-  const sel = state.records.find(r => r.id === state.recordSelectedId);
+  const sel = state.allRecords.find(r => r.id === state.recordSelectedId);
+  const filterName = state.familyFilter ? (memberById(state.familyFilter)?.name || '') : 'Whole family';
 
   const listHtml = filtered.length === 0 ? `
     <div class="text-center py-16 text-stone-400">
@@ -1053,16 +1098,19 @@ function renderRecords() {
       </div>`).join('');
 
   // Episodes view: list of threads for this member
-  const episodesListHtml = state.episodes.length === 0
+  const baseEpisodes = state.familyFilter ? state.allEpisodes.filter(e => e.mid === state.familyFilter) : state.allEpisodes;
+  const episodesListHtml = baseEpisodes.length === 0
     ? `<div class="text-center py-16 text-stone-400">${iconHtml('git-branch',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No threads yet</p><p class="text-sm mt-1">Group related documents into a health thread — e.g. "Liver Treatment" or "RHD / Cardiac"</p><button data-action="new-episode" class="mt-4 px-5 py-2.5 text-white rounded-xl text-sm font-bold inline-flex items-center gap-2 hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Create First Thread</button></div>`
-    : `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">${state.episodes.map(ep => {
-        const count = state.records.filter(r => r.episodeId === ep.id).length;
+    : `<div class="grid grid-cols-1 md:grid-cols-2 gap-3">${baseEpisodes.map(ep => {
+        const count = state.allRecords.filter(r => r.episodeId === ep.id).length;
         const st = epStatus(ep.status);
+        const owner = memberById(ep.mid);
         return `<div class="bg-white rounded-2xl p-4 border border-stone-100 shadow-sm hover:shadow-md cursor-pointer transition-all" data-action="open-episode" data-id="${ep.id}">
           <div class="flex items-start gap-3">
             <div class="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style="background:${ep.color}1a">${iconHtml('git-branch',17,'')}<span style="color:${ep.color}"></span></div>
             <div class="flex-1 min-w-0">
               <div class="flex items-center gap-2"><p class="font-bold text-stone-900 text-sm">${esc(ep.title)}</p>${badgeHtml(st.label, st.cls + ' ml-auto')}</div>
+              ${owner?`<div class="flex items-center gap-1.5 mt-1"><div class="w-4 h-4 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${owner.color};font-size:9px;font-weight:800">${owner.avatar}</div><span class="text-xs font-semibold text-stone-500">${esc(owner.name)}</span></div>`:''}
               ${ep.description?`<p class="text-xs text-stone-500 mt-1 line-clamp-2">${esc(ep.description)}</p>`:''}
               <p class="text-xs text-stone-400 mt-1.5">${count} document${count!==1?'s':''}${ep.startedOn?` · since ${fmtDate(ep.startedOn)}`:''}</p>
             </div>
@@ -1071,6 +1119,11 @@ function renderRecords() {
       }).join('')}</div>`;
 
   const isTime = state.recordsView === 'time';
+  // person filter chips (All + each active member)
+  const personChips = `<div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
+    <button data-action="family-filter" data-id="all" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap flex-shrink-0 transition-colors" style="${!state.familyFilter?`background:${C.teal};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}">${iconHtml('users',12,'inline')} All</button>
+    ${activeMembers().map(mem => `<button data-action="family-filter" data-id="${mem.id}" class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap flex-shrink-0 transition-colors" style="${state.familyFilter===mem.id?`background:${mem.color};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}"><span class="w-4 h-4 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${state.familyFilter===mem.id?'rgba(255,255,255,0.3)':mem.color};font-size:9px;font-weight:800">${mem.avatar}</span>${esc(mem.name.split(' ')[0])}</button>`).join('')}
+  </div>`;
 
   return `
   <div class="fade-in">
@@ -1078,9 +1131,12 @@ function renderRecords() {
     <div class="flex gap-5">
       <div class="flex-1 min-w-0 space-y-4">
         <div class="flex items-center justify-between">
-          <div><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medical Records</h1><p class="text-xs text-stone-400 mt-0.5">${state.records.length} records · ${state.episodes.length} threads · ${esc(m.name)}</p></div>
+          <div><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medical Records</h1><p class="text-xs text-stone-400 mt-0.5">${filtered.length} records · ${baseEpisodes.length} threads · ${esc(filterName)}</p></div>
           <button data-action="open-upload" class="flex items-center gap-2 px-4 py-2.5 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('upload',15)}<span class="hidden sm:inline">Upload Record</span><span class="sm:hidden">Upload</span></button>
         </div>
+
+        <!-- Person filter (family-first) -->
+        ${personChips}
 
         <!-- Time / Episodes toggle -->
         <div class="flex items-center gap-2">
@@ -1112,8 +1168,8 @@ function renderRecords() {
 function renderEpisodeDetail() {
   const ep = episodeById(state.openEpisodeId);
   if (!ep) { state.openEpisodeId = null; return renderRecords(); }
-  const m = currentMember();
-  const docs = state.records.filter(r => r.episodeId === ep.id);
+  const m = memberById(ep.mid) || currentMember();
+  const docs = state.allRecords.filter(r => r.episodeId === ep.id);
   const st = epStatus(ep.status);
   const grouped = groupByMonth(docs);
 
@@ -1138,7 +1194,7 @@ function renderEpisodeDetail() {
 
   return `
   <div class="fade-in max-w-3xl">
-    ${(() => { const sel = state.records.find(r => r.id === state.recordSelectedId); return sel ? renderRecordDetailModal(sel) : ''; })()}
+    ${(() => { const sel = anyRecord(state.recordSelectedId); return sel ? renderRecordDetailModal(sel) : ''; })()}
     <button data-action="close-episode" class="flex items-center gap-1.5 text-sm font-bold text-stone-400 hover:text-stone-600 mb-4">${iconHtml('arrow-left',15)} Back to records</button>
 
     <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5 mb-4">
@@ -1613,22 +1669,135 @@ async function handleSaveMetric() {
 //  FAMILY OVERVIEW
 // ─────────────────────────────────────────
 function renderFamily() {
+  const active = activeMembers();
+  const archived = state.members.filter(x => x.archived);
   return `<div class="space-y-4 fade-in">
-    ${renderAddMemberModal()}
-    <div class="flex items-center justify-between"><h1 class="text-xl md:text-2xl font-bold text-stone-900">Family Health</h1><button data-action="open-addmember" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add Member</button></div>
+    <div class="flex items-center justify-between"><h1 class="text-xl md:text-2xl font-bold text-stone-900">Family Health</h1><button data-action="open-member-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add Member</button></div>
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-      ${state.members.map(m => `
-        <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5 cursor-pointer hover:shadow-md transition-shadow" data-action="switch-member" data-id="${m.id}">
-          <div class="flex items-center gap-3 mb-4"><div class="w-12 h-12 rounded-full flex items-center justify-center text-white text-xl font-black flex-shrink-0" style="background:${m.color}">${m.avatar}</div><div><p class="font-bold text-stone-900">${esc(m.name)}</p><p class="text-xs text-stone-400">${esc(m.role)} · ${m.age||'?'}y · ${m.blood||'?'}</p></div></div>
-          <div class="flex items-center gap-3 mb-3">${scoreArcSvg(m.score,80)}<div class="text-sm"><p class="text-xs text-stone-400">BP</p><p class="font-bold text-stone-900">${esc(m.bp)}</p><p class="text-xs text-stone-400 mt-1">BMI</p><p class="font-bold text-stone-900">${m.bmi||'—'}</p></div></div>
+      ${active.map(m => {
+        const recCount = state.allRecords.filter(r => r.mid === m.id).length;
+        return `
+        <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5">
+          <div class="flex items-center gap-3 mb-4">
+            <div class="w-12 h-12 rounded-full flex items-center justify-center text-white text-xl font-black flex-shrink-0" style="background:${m.color}">${m.avatar}</div>
+            <div class="flex-1 min-w-0"><p class="font-bold text-stone-900">${esc(m.name)}</p><p class="text-xs text-stone-400">${esc(m.role)}${m.age?` · ${m.age}y`:''}${m.blood?` · ${m.blood}`:''}</p></div>
+            <button data-action="member-menu" data-id="${m.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400">${iconHtml('more-horizontal',16)}</button>
+          </div>
+          ${state.memberMenuFor===m.id?`<div class="mb-3 p-2 bg-stone-50 rounded-xl space-y-1">
+            <button data-action="open-member-edit" data-id="${m.id}" class="w-full text-left px-3 py-2 rounded-lg text-sm font-semibold text-stone-700 hover:bg-white flex items-center gap-2">${iconHtml('pencil',14)} Edit / Rename</button>
+            <button data-action="archive-member" data-id="${m.id}" class="w-full text-left px-3 py-2 rounded-lg text-sm font-semibold text-stone-700 hover:bg-white flex items-center gap-2">${iconHtml('eye-off',14)} Hide member</button>
+            <button data-action="delete-member" data-id="${m.id}" class="w-full text-left px-3 py-2 rounded-lg text-sm font-semibold text-rose-600 hover:bg-white flex items-center gap-2">${iconHtml('trash-2',14)} Delete permanently</button>
+          </div>`:''}
+          <div class="flex items-center gap-4 mb-3 text-sm">
+            <div><p class="text-xs text-stone-400">Records</p><p class="font-bold text-stone-900">${recCount}</p></div>
+            <div><p class="text-xs text-stone-400">BP</p><p class="font-bold text-stone-900">${esc(m.bp)}</p></div>
+            <div><p class="text-xs text-stone-400">BMI</p><p class="font-bold text-stone-900">${m.bmi||'—'}</p></div>
+          </div>
           ${m.conditions.length>0?`<div class="space-y-1 mb-3">${m.conditions.slice(0,3).map(c=>`<div class="flex items-center gap-2"><div class="w-1.5 h-1.5 rounded-full bg-amber-400"></div><span class="text-xs text-stone-600">${esc(c)}</span></div>`).join('')}</div>`:''}
-          ${m.nextVisit?`<div class="pt-3 border-t border-stone-100"><p class="text-xs text-stone-400">Next visit: <span class="font-bold text-stone-700">${fmtDate(m.nextVisit)}</span></p></div>`:''}
-          <button class="mt-3 w-full py-2.5 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${m.color}">Open Dashboard →</button>
-        </div>`).join('')}
-      <div class="border-2 border-dashed border-stone-200 rounded-2xl p-5 flex flex-col items-center justify-center gap-3 hover:border-teal-300 hover:bg-teal-50 transition-all cursor-pointer min-h-48" data-action="open-addmember">
+          <div class="flex gap-2 mt-3">
+            <button data-action="view-member-records" data-id="${m.id}" class="flex-1 py-2 border border-stone-200 rounded-xl text-xs font-bold text-stone-600 hover:bg-stone-50">View Records</button>
+            <button data-action="switch-member" data-id="${m.id}" class="flex-1 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${m.color}">Dashboard</button>
+          </div>
+        </div>`;
+      }).join('')}
+      <div class="border-2 border-dashed border-stone-200 rounded-2xl p-5 flex flex-col items-center justify-center gap-3 hover:border-teal-300 hover:bg-teal-50 transition-all cursor-pointer min-h-48" data-action="open-member-add">
         <div class="w-12 h-12 rounded-full bg-stone-100 flex items-center justify-center">${iconHtml('plus',22,'text-stone-400')}</div>
         <div class="text-center"><p class="font-bold text-stone-600">Add Family Member</p><p class="text-xs text-stone-400 mt-1">Parents, siblings, children</p></div>
       </div>
+    </div>
+    ${archived.length?`<div><p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-2 mt-4">Hidden (${archived.length})</p>
+      <div class="space-y-2">${archived.map(m=>`<div class="flex items-center gap-3 bg-stone-50 rounded-xl p-3">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black flex-shrink-0 opacity-60" style="background:${m.color}">${m.avatar}</div>
+        <span class="text-sm font-semibold text-stone-500 flex-1">${esc(m.name)}</span>
+        <button data-action="unarchive-member" data-id="${m.id}" class="text-xs font-bold text-teal-600 hover:underline">Unhide</button>
+        <button data-action="delete-member" data-id="${m.id}" class="text-xs font-bold text-rose-500 hover:underline">Delete</button>
+      </div>`).join('')}</div></div>`:''}
+  </div>`;
+}
+
+// ── Member editor modal (add / edit / rename + health values) ──
+function renderMemberEditor() {
+  const ed = state.memberEditor;
+  if (!ed) return '';
+  const isEdit = !!ed.id;
+  const f = (label, key, ph='', type='text') => `<div><label class="block text-xs font-bold text-stone-500 mb-1">${label}</label><input id="me-${key}" type="${type}" value="${ed[key]!=null?esc(String(ed[key])):''}" placeholder="${ph}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>`;
+  return `
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="member-editor-backdrop">
+    <div class="bg-white w-full md:max-w-lg rounded-t-3xl md:rounded-2xl p-6 shadow-2xl max-h-[90dvh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-4">
+        <h3 class="font-bold text-stone-900 text-lg">${isEdit?'Edit Member':(ed.fromUpload?`Add ${ed.name?esc(ed.name):'Member'}`:'Add Family Member')}</h3>
+        <button data-action="close-member-editor">${iconHtml('x',18,'text-stone-400')}</button>
+      </div>
+      <div class="grid grid-cols-2 gap-3">
+        <div class="col-span-2">${f('Full name *','name','e.g. Shreya Kukreja')}</div>
+        <div>
+          <label class="block text-xs font-bold text-stone-500 mb-1">Relationship</label>
+          <select id="me-role" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
+            ${['Self','Spouse','Father','Mother','Son','Daughter','Brother','Sister','Family'].map(r=>`<option ${ed.role===r?'selected':''}>${r}</option>`).join('')}
+          </select>
+        </div>
+        ${f('Age','age','','number')}
+        <div>
+          <label class="block text-xs font-bold text-stone-500 mb-1">Gender</label>
+          <select id="me-gender" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
+            ${['Female','Male','Other'].map(g=>`<option ${ed.gender===g?'selected':''}>${g}</option>`).join('')}
+          </select>
+        </div>
+        ${f('Blood group','blood','e.g. B+')}
+        <div class="col-span-2 pt-1"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide">Health values (optional)</p></div>
+        ${f('Height (cm)','height','','number')}
+        ${f('Weight (kg)','weight','','number')}
+        ${f('Blood pressure','bp','e.g. 120/80')}
+        ${f('HbA1c','hba1c','e.g. 5.6')}
+        <div class="col-span-2">${f('Conditions (comma-separated)','conditionsText','Hypertension, Diabetes')}</div>
+      </div>
+      <div class="flex gap-3 mt-5">
+        <button data-action="close-member-editor" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
+        <button id="me-save" class="flex-1 py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}" ${state.memberSaving?'disabled':''}>${state.memberSaving?spinnerHtml(15,'text-white'):''} ${isEdit?'Save Changes':'Add Member'}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ── Settings page ──
+function renderSettings() {
+  const email = state.session?.user?.email || '';
+  // App-side AI usage estimate: count AI-analysed docs + chat messages
+  const aiDocs = state.allRecords.filter(r => r.source === 'upload').length;
+  const chatMsgs = Math.floor((state.chatMsgs?.length || 0) / 2);
+  const estCost = (aiDocs * 3 + chatMsgs * 1.5); // rough ₹ estimate per call
+  return `<div class="space-y-5 fade-in max-w-2xl">
+    <h1 class="text-xl md:text-2xl font-bold text-stone-900">Settings</h1>
+
+    <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5">
+      <p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-3">Account</p>
+      <div class="flex items-center gap-3 mb-4"><div class="w-10 h-10 rounded-full flex items-center justify-center text-white font-black" style="background:${C.teal}">${esc((email[0]||'?').toUpperCase())}</div><div><p class="font-bold text-stone-800 text-sm">${esc(email)}</p><p class="text-xs text-stone-400">Super-owner · manages all members</p></div></div>
+      <button data-action="sign-out" class="w-full py-2.5 border border-stone-200 rounded-xl text-sm font-bold text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-2">${iconHtml('log-out',15)} Sign Out</button>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5">
+      <div class="flex items-center justify-between mb-3"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide">Family Members (${activeMembers().length})</p><button data-action="open-member-add" class="text-xs font-bold text-teal-600 hover:underline flex items-center gap-1">${iconHtml('plus',12)} Add</button></div>
+      <div class="space-y-2">
+        ${activeMembers().map(m=>`<div class="flex items-center gap-3 p-2 rounded-xl hover:bg-stone-50">
+          <div class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black flex-shrink-0" style="background:${m.color}">${m.avatar}</div>
+          <div class="flex-1 min-w-0"><p class="font-semibold text-stone-800 text-sm">${esc(m.name)}</p><p class="text-xs text-stone-400">${esc(m.role)}</p></div>
+          <button data-action="open-member-edit" data-id="${m.id}" class="p-1.5 rounded-lg hover:bg-white text-stone-400" title="Edit">${iconHtml('pencil',14)}</button>
+          <button data-action="archive-member" data-id="${m.id}" class="p-1.5 rounded-lg hover:bg-white text-stone-400" title="Hide">${iconHtml('eye-off',14)}</button>
+          <button data-action="delete-member" data-id="${m.id}" class="p-1.5 rounded-lg hover:bg-white text-rose-400" title="Delete">${iconHtml('trash-2',14)}</button>
+        </div>`).join('')}
+      </div>
+    </div>
+
+    <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-5">
+      <p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-3">AI Usage (this device)</p>
+      <div class="flex items-center gap-4">
+        <div><p class="text-2xl font-black text-stone-900">${aiDocs}</p><p class="text-xs text-stone-400">Documents analysed</p></div>
+        <div class="h-10 w-px bg-stone-100"></div>
+        <div><p class="text-2xl font-black text-stone-900">${chatMsgs}</p><p class="text-xs text-stone-400">AI Doctor chats</p></div>
+        <div class="h-10 w-px bg-stone-100"></div>
+        <div><p class="text-2xl font-black text-stone-900">≈₹${estCost}</p><p class="text-xs text-stone-400">Est. spend</p></div>
+      </div>
+      <p class="text-xs text-stone-400 mt-3">A rough estimate based on activity in this session. For your exact API balance, check console.anthropic.com → Billing.</p>
     </div>
   </div>`;
 }
@@ -1645,6 +1814,7 @@ const NAV = [
   { id:'aidoctor', label:'AI Doctor', icon:'brain', badge:'AI' },
   { id:'metrics', label:'Metrics', icon:'activity' },
   { id:'family', label:'Family', icon:'user' },
+  { id:'settings', label:'Settings', icon:'settings' },
 ];
 const MOBILE_MAIN = [
   { id:'dashboard', label:'Home', icon:'home' },
@@ -1657,6 +1827,7 @@ const MOBILE_MORE = [
   { id:'spending', label:'Spending', icon:'dollar-sign', desc:'Bills, savings' },
   { id:'metrics', label:'Metrics', icon:'activity', desc:'BP, weight, steps' },
   { id:'family', label:'Family', icon:'user', desc:'All members' },
+  { id:'settings', label:'Settings', icon:'settings', desc:'Account, AI usage' },
 ];
 
 function renderSidebar() {
@@ -1739,6 +1910,7 @@ function renderPageContent() {
     case 'aidoctor': return renderAIDoctor();
     case 'metrics': return renderMetrics();
     case 'family': return renderFamily();
+    case 'settings': return renderSettings();
     default: return renderDashboard();
   }
 }
@@ -1746,11 +1918,11 @@ function renderPageContent() {
 function renderMainApp() {
   // Modals rendered at top level so they appear regardless of which page is active
   // (fixes filing UI vanishing when upload completes from any page).
-  const sel = state.records.find(r => r.id === state.recordSelectedId);
   const globalModals = `
     ${state.uploadModal ? renderUploadModal() : ''}
     ${state.fileModal ? renderFileModal() : ''}
     ${state.episodeEditor ? renderEpisodeEditor() : ''}
+    ${state.memberEditor ? renderMemberEditor() : ''}
   `;
   return `<div class="flex h-screen bg-stone-50 overflow-hidden" id="app-root">
     ${renderSidebar()}
@@ -1844,12 +2016,40 @@ document.addEventListener('click', async (e) => {
       await supabaseClient.auth.signOut();
       break;
 
-    // ── Add Member ──
+    // ── Add Member (legacy modal, still supported) ──
     case 'open-addmember':
       setState({ addMemberModal: true });
       break;
     case 'close-addmember':
       setState({ addMemberModal: false });
+      break;
+
+    // ── Member management (new) ──
+    case 'open-member-add':
+      setState({ memberEditor: { name: '', role: 'Family', gender: 'Female' }, memberMenuFor: null, moreSheetOpen: false });
+      break;
+    case 'open-member-edit': {
+      const mem = memberById(el.dataset.id);
+      if (mem) setState({ memberEditor: { id: mem.id, name: mem.name, role: mem.role, age: mem.age, gender: mem.gender, blood: mem.blood, height: mem.height, weight: mem.weight, bp: mem.bp==='—'?'':mem.bp, hba1c: mem.hba1c==='—'?'':mem.hba1c, conditionsText: (mem.conditions||[]).join(', ') }, memberMenuFor: null });
+      break;
+    }
+    case 'close-member-editor':
+      setState({ memberEditor: null });
+      break;
+    case 'member-menu':
+      setState({ memberMenuFor: state.memberMenuFor === el.dataset.id ? null : el.dataset.id });
+      break;
+    case 'archive-member':
+      await handleArchiveMember(el.dataset.id, true);
+      break;
+    case 'unarchive-member':
+      await handleArchiveMember(el.dataset.id, false);
+      break;
+    case 'delete-member':
+      await handleDeleteMember(el.dataset.id);
+      break;
+    case 'view-member-records':
+      setState({ familyFilter: el.dataset.id, page: 'records', memberMenuFor: null, recordsView: 'time' });
       break;
 
     // ── Upload Modal ──
@@ -1866,6 +2066,18 @@ document.addEventListener('click', async (e) => {
       break;
     case 'save-upload':
       saveUploadRecord(el.dataset.memberId);
+      break;
+    case 'set-upload-target':
+      setState({ uploadTargetId: el.dataset.id });
+      break;
+    case 'upload-add-member': {
+      // open member editor prefilled with the AI-detected name; on save it becomes the upload target
+      const detected = state.uploadModal?.ext?.patientName || '';
+      setState({ memberEditor: { name: detected, role: 'Family', gender: 'Female', fromUpload: true } });
+      break;
+    }
+    case 'family-filter':
+      setState({ familyFilter: el.dataset.id === 'all' ? null : el.dataset.id, recordSelectedId: null, openEpisodeId: null });
       break;
 
     // ── Records ──
@@ -1896,7 +2108,7 @@ document.addEventListener('click', async (e) => {
       setState({ openEpisodeId: null });
       break;
     case 'new-episode':
-      setState({ episodeEditor: { mid: state.currentId, title: '', status: 'active', description: '' } });
+      setState({ episodeEditor: { mid: state.familyFilter || state.currentId, title: '', status: 'active', description: '' } });
       break;
     case 'edit-episode': {
       const ep = episodeById(el.dataset.id);
@@ -1966,6 +2178,7 @@ document.addEventListener('click', async (e) => {
   if (e.target.id === 'auth-submit') handleAuthSubmit();
   if (e.target.id === 'ob-save') handleOnboardingSave();
   if (e.target.id === 'am-save') handleAddMemberSave();
+  if (e.target.id === 'me-save') handleSaveMember();
   if (e.target.id === 'dl-save') handleSaveDailyLog();
   if (e.target.id === 'metric-save') handleSaveMetric();
   if (e.target.id === 'ep-save') handleSaveEpisode();
@@ -2041,17 +2254,33 @@ async function loadMemberData(memberId) {
     setState({ records, logs, metrics, episodes });
   } catch (e) { console.error(e); }
 }
+// Family-wide records + episodes (all members) for the Records page
+async function loadFamilyData() {
+  if (!state.session) return;
+  try {
+    const [allRecords, allEpisodes] = await Promise.all([db.getAllRecords(state.session.user.id), db.getAllEpisodes(state.session.user.id)]);
+    setState({ allRecords, allEpisodes });
+  } catch (e) { console.error(e); }
+}
+// Look up a record family-wide (falls back to current-member list)
+function anyRecord(id) { return state.allRecords.find(r => r.id === id) || state.records.find(r => r.id === id); }
+
 async function handleDeleteRecord(id) {
   if (!confirm('Delete this record?')) return;
   setState({ recordDeleting: id });
   try {
     await db.deleteRecord(id);
-    setState({ records: state.records.filter(r => r.id !== id), recordDeleting: null, recordSelectedId: state.recordSelectedId === id ? null : state.recordSelectedId });
+    await loadFamilyData();
+    setState({
+      records: state.records.filter(r => r.id !== id),
+      recordDeleting: null,
+      recordSelectedId: state.recordSelectedId === id ? null : state.recordSelectedId,
+    });
   } catch { setState({ recordDeleting: null }); }
 }
 
 async function handleViewOriginal(id) {
-  const rec = state.records.find(r => r.id === id);
+  const rec = anyRecord(id);
   if (!rec || !rec.filePath) { showToast('No original file stored for this record'); return; }
   showToast('Opening document…');
   try {
@@ -2064,13 +2293,12 @@ async function handleViewOriginal(id) {
 
 // ── Episode / filing actions ──
 function openFileModal(recordId) {
-  const rec = state.records.find(r => r.id === recordId);
-  // Simple heuristic proposal: if there's an episode whose title words appear in the record's
-  // title/summary/tags, propose it implicitly by ordering; otherwise propose a new-thread name
-  // derived from the diagnosis or a key tag. (AI-driven proposal comes in the upload flow later.)
+  const rec = anyRecord(recordId);
+  // Propose a new-thread name from the diagnosis if it doesn't match an existing thread for this member
   let proposedNewTitle = '';
-  const dx = rec.extracted?.diagnosis;
-  if (dx && !state.episodes.some(e => e.title.toLowerCase() === dx.toLowerCase())) {
+  const dx = rec?.extracted?.diagnosis;
+  const memberEps = state.allEpisodes.filter(e => e.mid === rec?.mid);
+  if (dx && !memberEps.some(e => e.title.toLowerCase() === dx.toLowerCase())) {
     proposedNewTitle = dx.length > 40 ? (rec.tags?.[0] || '') : dx;
   }
   setState({ fileModal: { recordId, proposedNewTitle }, recordSelectedId: null });
@@ -2079,18 +2307,22 @@ function openFileModal(recordId) {
 async function handleFileRecord(recordId, episodeId) {
   try {
     await db.setRecordEpisode(recordId, episodeId);
-    const records = state.records.map(r => r.id === recordId ? { ...r, episodeId: episodeId || null } : r);
-    setState({ records, fileModal: null });
+    const patch = r => r.id === recordId ? { ...r, episodeId: episodeId || null } : r;
+    await loadFamilyData();
+    setState({ records: state.records.map(patch), fileModal: null });
     showToast(episodeId ? 'Filed to thread ✓' : 'Removed from thread');
   } catch (e) { showToast('Could not file — try again'); }
 }
 
 async function handleFileToNewEpisode(recordId, title) {
   try {
-    const ep = await db.addEpisode(state.session.user.id, { mid: state.currentId, title, status: 'active' });
+    const rec = anyRecord(recordId);
+    const ep = await db.addEpisode(state.session.user.id, { mid: rec?.mid || state.currentId, title, status: 'active' });
     await db.setRecordEpisode(recordId, ep.id);
-    const records = state.records.map(r => r.id === recordId ? { ...r, episodeId: ep.id } : r);
-    setState({ episodes: [ep, ...state.episodes], records, fileModal: null });
+    await loadFamilyData();
+    const patch = r => r.id === recordId ? { ...r, episodeId: ep.id } : r;
+    const episodes = rec?.mid === state.currentId ? [ep, ...state.episodes] : state.episodes;
+    setState({ episodes, records: state.records.map(patch), fileModal: null });
     showToast(`Created "${title}" ✓`);
   } catch (e) { showToast('Could not create thread — try again'); }
 }
@@ -2103,20 +2335,16 @@ async function handleSaveEpisode() {
   try {
     if (ed.id) {
       await db.updateEpisode(ed.id, { title, status: ed.status, description });
-      const episodes = state.episodes.map(e => e.id === ed.id ? { ...e, title, status: ed.status, description } : e);
-      setState({ episodes, episodeEditor: null });
+      await loadFamilyData();
+      setState({ episodes: state.episodes.map(e => e.id === ed.id ? { ...e, title, status: ed.status, description } : e), episodeEditor: null });
       showToast('Thread updated ✓');
     } else {
       const ep = await db.addEpisode(state.session.user.id, { mid: ed.mid, title, status: ed.status, description });
-      const episodes = [ep, ...state.episodes];
-      // if this editor was opened to file a specific record into the new thread, do that now
-      if (ed.fileRecordId) {
-        await db.setRecordEpisode(ed.fileRecordId, ep.id);
-        const records = state.records.map(r => r.id === ed.fileRecordId ? { ...r, episodeId: ep.id } : r);
-        setState({ episodes, records, episodeEditor: null });
-      } else {
-        setState({ episodes, episodeEditor: null });
-      }
+      if (ed.fileRecordId) await db.setRecordEpisode(ed.fileRecordId, ep.id);
+      await loadFamilyData();
+      const episodes = ed.mid === state.currentId ? [ep, ...state.episodes] : state.episodes;
+      const records = ed.fileRecordId ? state.records.map(r => r.id === ed.fileRecordId ? { ...r, episodeId: ep.id } : r) : state.records;
+      setState({ episodes, records, episodeEditor: null });
       showToast(`Created "${title}" ✓`);
     }
   } catch (e) { showToast('Could not save — try again'); }
@@ -2126,10 +2354,77 @@ async function handleDeleteEpisode(id) {
   if (!confirm('Delete this thread? The documents in it will remain, just un-filed.')) return;
   try {
     await db.deleteEpisode(id);
-    // records that referenced it become unfiled locally
-    const records = state.records.map(r => r.episodeId === id ? { ...r, episodeId: null } : r);
-    setState({ episodes: state.episodes.filter(e => e.id !== id), records, openEpisodeId: state.openEpisodeId === id ? null : state.openEpisodeId });
+    await loadFamilyData();
+    setState({
+      episodes: state.episodes.filter(e => e.id !== id),
+      records: state.records.map(r => r.episodeId === id ? { ...r, episodeId: null } : r),
+      openEpisodeId: state.openEpisodeId === id ? null : state.openEpisodeId,
+    });
     showToast('Thread deleted');
+  } catch { showToast('Could not delete — try again'); }
+}
+
+// ── Member management ──
+async function handleSaveMember() {
+  const ed = state.memberEditor;
+  const val = k => document.getElementById('me-' + k)?.value?.trim() || '';
+  const name = val('name');
+  if (!name) { showToast('Please enter a name'); return; }
+  const splitList = s => s.split(',').map(x => x.trim()).filter(Boolean);
+  const patch = {
+    name, role: val('role') || 'Family', gender: val('gender') || 'Female',
+    age: val('age') ? +val('age') : null, blood: val('blood'),
+    height: val('height') ? +val('height') : null, weight: val('weight') ? +val('weight') : null,
+    bp: val('bp'), hba1c: val('hba1c'), conditions: splitList(val('conditionsText')),
+  };
+  setState({ memberSaving: true });
+  try {
+    if (ed.id) {
+      await db.updateMember(ed.id, patch);
+      await Promise.all([reloadMembers(), loadFamilyData()]);
+      setState({ memberSaving: false, memberEditor: null });
+      showToast('Member updated ✓');
+    } else {
+      await db.addMember(state.session.user.id, { ...patch, color: MEMBER_COLORS[state.members.length % MEMBER_COLORS.length], score: 80 });
+      await reloadMembers();
+      const added = state.members.find(x => x.name === name && x.role === patch.role) || state.members[state.members.length - 1];
+      const wasFromUpload = ed.fromUpload;
+      setState({ memberSaving: false, memberEditor: null, currentId: state.currentId || (added && added.id), uploadTargetId: wasFromUpload && added ? added.id : state.uploadTargetId });
+      showToast(`${name.split(' ')[0]} added ✓`);
+    }
+  } catch (e) { setState({ memberSaving: false }); showToast('Could not save — try again'); }
+}
+
+async function reloadMembers() {
+  try { state.members = await db.getMembers(state.session.user.id); } catch (e) { console.error(e); }
+}
+
+async function handleArchiveMember(id, archived) {
+  try {
+    await db.updateMember(id, { archived });
+    await reloadMembers();
+    // If we archived the active/filter member, reset
+    const patch = {};
+    if (archived && state.familyFilter === id) patch.familyFilter = null;
+    if (archived && state.currentId === id) { const first = activeMembers()[0]; if (first) { await switchMember(first.id); } }
+    setState({ memberMenuFor: null, ...patch });
+    showToast(archived ? 'Member hidden' : 'Member unhidden');
+  } catch { showToast('Could not update — try again'); }
+}
+
+async function handleDeleteMember(id) {
+  const mem = memberById(id);
+  if (!mem) return;
+  const recCount = state.allRecords.filter(r => r.mid === id).length;
+  if (!confirm(`Permanently delete ${mem.name} and ALL their data (${recCount} record${recCount!==1?'s':''}, threads, follow-ups)? This cannot be undone.`)) return;
+  try {
+    await db.deleteMember(id);
+    await Promise.all([reloadMembers(), loadFamilyData()]);
+    const patch = { memberMenuFor: null };
+    if (state.familyFilter === id) patch.familyFilter = null;
+    if (state.currentId === id) { const first = activeMembers()[0]; if (first) { await switchMember(first.id); } }
+    setState(patch);
+    showToast(`${mem.name} deleted`);
   } catch { showToast('Could not delete — try again'); }
 }
 
@@ -2170,8 +2465,12 @@ async function loadMembersForSession(session) {
     state.members = members;
     state.membersLoading = false;
     if (members.length > 0) {
-      state.currentId = members[0].id;
-      await loadMemberData(members[0].id);
+      // Default the active profile to "Self" if present, else the first member
+      const self = members.find(x => x.role === 'Self') || members[0];
+      state.currentId = self.id;
+      state.lastUploadMemberId = self.id;
+      await loadMemberData(self.id);
+      await loadFamilyData();
     }
   } catch (e) {
     console.error(e);

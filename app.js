@@ -257,6 +257,12 @@ const db = {
     if (error) throw error;
     return path;
   },
+  async getSignedUrl(filePath) {
+    // Creates a temporary (1 hour) private link to view/download the original file
+    const { data, error } = await supabaseClient.storage.from('medical-documents').createSignedUrl(filePath, 3600);
+    if (error) throw error;
+    return data.signedUrl;
+  },
   async getLogs(memberId) {
     const { data, error } = await supabaseClient.from('daily_logs').select('*').eq('member_id', memberId).order('date', { ascending: false }).limit(30);
     if (error) throw error;
@@ -612,7 +618,13 @@ async function runUploadAnalysis(file) {
   let si = 0;
   const tick = setInterval(() => {
     si = Math.min(si + 1, PROGRESS_STEPS.length - 1);
-    setState({ uploadModal: { ...state.uploadModal, pct: PROGRESS_STEPS[si].pct, progressMsg: PROGRESS_STEPS[si].msg } });
+    // Update only the progress DOM nodes in place — avoids a full re-render that makes the page jump
+    state.uploadModal.pct = PROGRESS_STEPS[si].pct;
+    state.uploadModal.progressMsg = PROGRESS_STEPS[si].msg;
+    const bar = document.getElementById('upload-progress-bar');
+    const msg = document.getElementById('upload-progress-msg');
+    if (bar) bar.style.width = PROGRESS_STEPS[si].pct + '%';
+    if (msg) msg.textContent = PROGRESS_STEPS[si].msg;
   }, 1000);
   try {
     const extracted = await analyseDocument(file);
@@ -721,8 +733,8 @@ function renderUploadModal() {
           <div class="absolute inset-0 rounded-full border-4 spin" style="border-color:${C.teal} transparent transparent transparent"></div>
           <div class="absolute inset-0 flex items-center justify-center">${iconHtml('brain',26)}</div>
         </div>
-        <div class="text-center"><p class="font-bold text-stone-900">AI is reading your document</p><p class="text-sm text-stone-400 mt-1">${esc(um.progressMsg)}</p></div>
-        <div class="w-full bg-stone-100 rounded-full h-2 overflow-hidden"><div class="h-2 rounded-full transition-all duration-700" style="width:${um.pct}%;background:${C.teal}"></div></div>
+        <div class="text-center"><p class="font-bold text-stone-900">AI is reading your document</p><p id="upload-progress-msg" class="text-sm text-stone-400 mt-1">${esc(um.progressMsg)}</p></div>
+        <div class="w-full bg-stone-100 rounded-full h-2 overflow-hidden"><div id="upload-progress-bar" class="h-2 rounded-full transition-all duration-700" style="width:${um.pct}%;background:${C.teal}"></div></div>
         ${um.file ? `<div class="flex items-center gap-2 px-3 py-2 bg-stone-50 rounded-xl text-xs text-stone-500 w-full">${iconHtml('file-text',13)}<span class="truncate flex-1">${esc(um.file.name)}</span><span>${(um.file.size/1024).toFixed(0)} KB</span></div>` : ''}
       </div>`;
   } else if (um.phase === 'mismatch') {
@@ -973,7 +985,9 @@ function renderRecords() {
     <div class="hidden lg:block w-80 flex-shrink-0">
       ${cardOpen('p-5 sticky top-0 max-h-screen overflow-y-auto')}
         <div class="flex items-center justify-between mb-4"><p class="font-bold text-stone-900">Record Details</p><button data-action="deselect-record">${iconHtml('x',15,'text-stone-400')}</button></div>
-        ${(() => { const ts = typeStyle(sel.type); return `<div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-4">${iconHtml(ts.icon,16)}<span>${ts.label}</span>${sel.source==='upload'?badgeHtml('AI','ml-auto bg-teal-100 text-teal-700 text-xs'):''}</div>`; })()}
+        ${(() => { const mem = state.members.find(x => x.id === sel.mid); const ep = sel.episodeId ? episodeById(sel.episodeId) : null; return mem ? `<div class="flex items-center gap-2 mb-3"><div class="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div><span class="text-sm font-bold text-stone-700">${esc(mem.name)}</span>${ep?`<span class="ml-auto inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold" style="background:${ep.color}1a;color:${ep.color}">${iconHtml('git-branch',10)}${esc(ep.title)}</span>`:''}</div>` : ''; })()}
+        ${(() => { const ts = typeStyle(sel.type); return `<div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-3">${iconHtml(ts.icon,16)}<span>${ts.label}</span>${sel.source==='upload'?badgeHtml('AI','ml-auto bg-teal-100 text-teal-700 text-xs'):''}</div>`; })()}
+        ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
         <div class="space-y-2.5 text-sm">
           ${[{l:'Date',v:fmtDate(sel.date)},{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
         </div>
@@ -1026,6 +1040,7 @@ function renderRecords() {
                     ${r.source==='upload'?badgeHtml('AI analysed','bg-teal-50 text-teal-700'):''}
                     ${badgeHtml(r.priority, priBadge(r.priority)+' ml-auto')}
                   </div>
+                  ${(() => { const mem = state.members.find(x => x.id === r.mid); return mem ? `<div class="flex items-center gap-1.5 mt-1"><div class="w-4 h-4 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:9px;font-weight:800">${mem.avatar}</div><span class="text-xs font-semibold text-stone-500">${esc(mem.name)}</span></div>` : ''; })()}
                   <p class="text-xs text-stone-400 mt-0.5 mb-1">${fmtDate(r.date)}${r.doctor?` · ${esc(r.doctor)}`:''}${r.hospital?` · ${esc(r.hospital)}`:''}${r.amount?` · ${fmtINR(r.amount)}`:''}</p>
                   <p class="text-sm text-stone-600 line-clamp-2">${esc(r.summary)}</p>
                 </div>
@@ -1059,9 +1074,7 @@ function renderRecords() {
 
   return `
   <div class="fade-in">
-    ${renderUploadModal()}
-    ${renderEpisodeEditor()}
-    ${renderFileModal()}
+    ${sel ? `<div class="lg:hidden">${renderRecordDetailModal(sel)}</div>` : ''}
     <div class="flex gap-5">
       <div class="flex-1 min-w-0 space-y-4">
         <div class="flex items-center justify-between">
@@ -1125,9 +1138,6 @@ function renderEpisodeDetail() {
 
   return `
   <div class="fade-in max-w-3xl">
-    ${renderUploadModal()}
-    ${renderEpisodeEditor()}
-    ${renderFileModal()}
     ${(() => { const sel = state.records.find(r => r.id === state.recordSelectedId); return sel ? renderRecordDetailModal(sel) : ''; })()}
     <button data-action="close-episode" class="flex items-center gap-1.5 text-sm font-bold text-stone-400 hover:text-stone-600 mb-4">${iconHtml('arrow-left',15)} Back to records</button>
 
@@ -1162,19 +1172,38 @@ function renderEpisodeDetail() {
 // A lightweight record-detail modal (used from episode view where there's no side panel)
 function renderRecordDetailModal(sel) {
   const ts = typeStyle(sel.type);
+  const mem = state.members.find(x => x.id === sel.mid);
+  const ep = sel.episodeId ? episodeById(sel.episodeId) : null;
+  const ex = sel.extracted || {};
   return `
   <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" data-action="deselect-record">
     <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-5 shadow-2xl max-h-[90dvh] overflow-y-auto" onclick="event.stopPropagation()">
-      <div class="flex items-center justify-between mb-4"><p class="font-bold text-stone-900">Record Details</p><button data-action="deselect-record">${iconHtml('x',18,'text-stone-400')}</button></div>
-      <div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-4">${iconHtml(ts.icon,16)}<span>${ts.label}</span></div>
+      <div class="flex items-center justify-between mb-3"><p class="font-bold text-stone-900">Record Details</p><button data-action="deselect-record">${iconHtml('x',18,'text-stone-400')}</button></div>
+
+      ${mem ? `<div class="flex items-center gap-2 mb-3">
+        <div class="w-7 h-7 rounded-full flex items-center justify-center text-white text-xs font-black flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div>
+        <span class="text-sm font-bold text-stone-700">${esc(mem.name)}</span>
+        ${ep?`<span class="ml-auto inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-semibold" style="background:${ep.color}1a;color:${ep.color}">${iconHtml('git-branch',10)}${esc(ep.title)}</span>`:''}
+      </div>`:''}
+
+      <div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-3">${iconHtml(ts.icon,16)}<span>${ts.label}</span>${sel.source==='upload'?badgeHtml('AI','ml-auto bg-teal-100 text-teal-700 text-xs'):''}</div>
+
+      ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
+
       <div class="space-y-2.5 text-sm">
         ${[{l:'Date',v:fmtDate(sel.date)},{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
       </div>
       ${sel.summary?`<div class="mt-3 p-3 bg-teal-50 rounded-xl"><p class="text-xs font-bold text-teal-700 mb-0.5">Summary</p><p class="text-sm text-teal-800">${esc(sel.summary)}</p></div>`:''}
-      ${sel.extracted?.keyValues?`<div class="mt-3 space-y-1.5">${sel.extracted.keyValues.map(kv=>`<div class="flex items-baseline justify-between px-2 py-1.5 rounded-lg ${kv.status==='critical'?'bg-rose-100':kv.status==='high'||kv.status==='low'?'bg-rose-50':kv.status==='borderline'?'bg-amber-50':'bg-stone-50'}"><span class="text-xs text-stone-500">${esc(kv.name)}</span><span class="text-sm font-bold ${statusColor(kv.status)}">${esc(kv.value)}</span></div>`).join('')}</div>`:''}
+      ${ex.diagnosis?`<div class="mt-3"><p class="text-xs text-stone-400">Diagnosis</p><p class="text-sm text-stone-800">${esc(ex.diagnosis)}</p></div>`:''}
+      ${ex.keyValues?`<div class="mt-3"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-1.5">Lab Values</p><div class="space-y-1.5">${ex.keyValues.map(kv=>`<div class="flex items-baseline justify-between px-2 py-1.5 rounded-lg ${kv.status==='critical'?'bg-rose-100':kv.status==='high'||kv.status==='low'?'bg-rose-50':kv.status==='borderline'?'bg-amber-50':'bg-stone-50'}"><span class="text-xs text-stone-500">${esc(kv.name)}</span><div class="text-right"><span class="text-sm font-bold ${statusColor(kv.status)}">${esc(kv.value)}</span>${kv.normal?`<p class="text-xs text-stone-400">ref: ${esc(kv.normal)}</p>`:''}</div></div>`).join('')}</div></div>`:''}
+      ${ex.meds?`<div class="mt-3"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-1.5">Medications</p>${ex.meds.map(med=>`<div class="flex items-center gap-2 text-sm mb-1">${iconHtml('pill',12,'text-teal-600')}<span class="text-stone-700">${esc(med)}</span></div>`).join('')}</div>`:''}
+      ${ex.advice?`<div class="mt-3 p-2.5 bg-teal-50 rounded-xl"><p class="text-xs font-bold text-teal-700 mb-0.5">Advice</p><p class="text-xs text-teal-700">${esc(ex.advice)}</p></div>`:''}
+      ${ex.followup?`<div class="mt-3 p-2.5 bg-amber-50 rounded-xl"><p class="text-xs font-bold text-amber-700 mb-0.5">Follow-up</p><p class="text-xs text-amber-700">${esc(ex.followup)}</p></div>`:''}
+      ${ex.items?`<div class="mt-3 space-y-1">${ex.items.map(it=>`<div class="flex justify-between text-xs"><span class="text-stone-500">${esc(it.name)}</span><span class="font-semibold">${fmtINR(it.amt)}</span></div>`).join('')}${sel.amount?`<div class="flex justify-between text-sm font-bold border-t pt-1 mt-1"><span>Total</span><span>${fmtINR(sel.amount)}</span></div>`:''}</div>`:''}
+
       <div class="mt-4 flex gap-2">
         <button data-action="file-record" data-id="${sel.id}" class="flex-1 py-2 border border-stone-200 rounded-xl text-xs font-bold text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('git-branch',13)} Change thread</button>
-        <button data-action="delete-record" data-id="${sel.id}" class="flex-1 py-2 border border-rose-200 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-1">${iconHtml('trash-2',13)} Delete</button>
+        <button data-action="delete-record" data-id="${sel.id}" class="flex-1 py-2 border border-rose-200 text-rose-600 rounded-xl text-xs font-bold hover:bg-rose-50 flex items-center justify-center gap-1">${state.recordDeleting===sel.id?spinnerHtml(12):iconHtml('trash-2',13)} Delete</button>
       </div>
     </div>
   </div>`;
@@ -1242,12 +1271,11 @@ function renderFileModal() {
             <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('plus',15,'text-white')}</div>
             <div><p class="font-bold text-stone-900 text-sm">Create "${esc(fm.proposedNewTitle)}"</p><p class="text-xs text-stone-500">New thread</p></div>
           </button>
-        ` : `
-          <button data-action="file-to-new-blank" class="w-full flex items-center gap-3 p-3 border border-stone-200 rounded-xl text-left hover:bg-stone-50">
-            <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('plus',15,'text-white')}</div>
-            <div><p class="font-bold text-stone-900 text-sm">Create a new thread…</p></div>
-          </button>
-        `}
+        ` : ''}
+        <button data-action="file-to-new-blank" class="w-full flex items-center gap-3 p-3 border border-stone-200 rounded-xl text-left hover:bg-stone-50">
+          <div class="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('plus',15,'text-white')}</div>
+          <div><p class="font-bold text-stone-900 text-sm">${fm.proposedNewTitle ? 'Create a different thread…' : 'Create a new thread…'}</p><p class="text-xs text-stone-500">Name it yourself</p></div>
+        </button>
         ${state.episodes.length ? `<p class="text-xs font-bold text-stone-400 uppercase tracking-wide pt-2">${fm.proposedMatchId?'Suggested & existing threads':'Existing threads'}</p>` : ''}
         ${[...state.episodes].sort((a,b) => (b.id===fm.proposedMatchId?1:0)-(a.id===fm.proposedMatchId?1:0)).map(ep => {
           const isSuggested = ep.id === fm.proposedMatchId;
@@ -1716,6 +1744,14 @@ function renderPageContent() {
 }
 
 function renderMainApp() {
+  // Modals rendered at top level so they appear regardless of which page is active
+  // (fixes filing UI vanishing when upload completes from any page).
+  const sel = state.records.find(r => r.id === state.recordSelectedId);
+  const globalModals = `
+    ${state.uploadModal ? renderUploadModal() : ''}
+    ${state.fileModal ? renderFileModal() : ''}
+    ${state.episodeEditor ? renderEpisodeEditor() : ''}
+  `;
   return `<div class="flex h-screen bg-stone-50 overflow-hidden" id="app-root">
     ${renderSidebar()}
     <div class="flex-1 flex flex-col overflow-hidden">
@@ -1724,6 +1760,7 @@ function renderMainApp() {
     </div>
     ${renderBottomNav()}
     ${renderMoreSheet()}
+    ${globalModals}
     ${toastHtml()}
   </div>`;
 }
@@ -1838,6 +1875,9 @@ document.addEventListener('click', async (e) => {
       break;
     case 'delete-record':
       await handleDeleteRecord(el.dataset.id);
+      break;
+    case 'view-original':
+      await handleViewOriginal(el.dataset.id);
       break;
 
     // ── Episodes / threads ──
@@ -2003,6 +2043,18 @@ async function handleDeleteRecord(id) {
     await db.deleteRecord(id);
     setState({ records: state.records.filter(r => r.id !== id), recordDeleting: null, recordSelectedId: state.recordSelectedId === id ? null : state.recordSelectedId });
   } catch { setState({ recordDeleting: null }); }
+}
+
+async function handleViewOriginal(id) {
+  const rec = state.records.find(r => r.id === id);
+  if (!rec || !rec.filePath) { showToast('No original file stored for this record'); return; }
+  showToast('Opening document…');
+  try {
+    const url = await db.getSignedUrl(rec.filePath);
+    window.open(url, '_blank');
+  } catch (e) {
+    showToast('Could not open the file — try again');
+  }
 }
 
 // ── Episode / filing actions ──

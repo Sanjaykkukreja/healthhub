@@ -49,6 +49,9 @@ let state = {
   episodes: [],
   allRecords: [],             // family-wide records (all members) for the Records page
   allEpisodes: [],            // family-wide episodes
+  allFollowups: [],           // family-wide follow-ups (dated next-actions)
+  followupEditor: null,       // { id?, mid, title, kind, dueDate, notes } add/edit follow-up modal
+  followupSaving: false,
   familyView: true,           // true = Whole Family (all pages); false = the single member in currentId
   lastUploadMemberId: null,   // remembers who the previous upload was filed to (default for next)
   uploadTargetId: null,       // the member selected in the upload "who is this for?" step
@@ -217,6 +220,40 @@ const db = {
       startedOn: e.started_on, color: e.color || C.teal,
     }));
   },
+  // ── Follow-ups (dated next-actions) ──
+  async getAllFollowups(userId) {
+    const { data, error } = await supabaseClient.from('followups').select('*').eq('owner_id', userId).order('due_date', { ascending: true });
+    if (error) throw error;
+    return data.map(f => ({
+      id: f.id, mid: f.member_id, episodeId: f.episode_id, title: f.title,
+      kind: f.kind || 'test', dueDate: f.due_date, dateSource: f.date_source || 'explicit',
+      status: f.status || 'pending', recurring: f.recurring || false, recurMonths: f.recur_months,
+      completedOn: f.completed_on, completedRecordId: f.completed_record_id,
+      notes: f.notes, sourceRecordId: f.source_record_id,
+    }));
+  },
+  async addFollowup(userId, f) {
+    const { data, error } = await supabaseClient.from('followups').insert([{
+      owner_id: userId, member_id: f.mid, episode_id: f.episodeId || null, title: f.title,
+      kind: f.kind || 'test', due_date: f.dueDate || null, date_source: f.dateSource || 'explicit',
+      status: 'pending', recurring: f.recurring || false, recur_months: f.recurMonths || null,
+      notes: f.notes || null, source_record_id: f.sourceRecordId || null,
+    }]).select().single();
+    if (error) throw error;
+    return { id: data.id, mid: f.mid, episodeId: f.episodeId || null, title: f.title, kind: f.kind || 'test', dueDate: f.dueDate || null, dateSource: f.dateSource || 'explicit', status: 'pending', recurring: f.recurring || false, recurMonths: f.recurMonths || null, notes: f.notes || null, sourceRecordId: f.sourceRecordId || null };
+  },
+  async updateFollowup(id, patch) {
+    const upd = {};
+    const map = { title:'title', kind:'kind', dueDate:'due_date', status:'status', notes:'notes',
+      recurring:'recurring', recurMonths:'recur_months', completedOn:'completed_on', completedRecordId:'completed_record_id' };
+    for (const k in patch) if (map[k]) upd[map[k]] = patch[k];
+    const { error } = await supabaseClient.from('followups').update(upd).eq('id', id);
+    if (error) throw error;
+  },
+  async deleteFollowup(id) {
+    const { error } = await supabaseClient.from('followups').delete().eq('id', id);
+    if (error) throw error;
+  },
   async addMember(userId, data) {
     const { data: row, error } = await supabaseClient.from('family_members').insert([{
       owner_id: userId, name: data.name, role: data.role || 'Self', age: data.age,
@@ -365,6 +402,8 @@ Respond with ONLY valid JSON (no markdown fences):
   "keyValues": [{"name":"","value":"","status":"normal|high|low|critical|borderline","normal":""}],
   "advice": "lifestyle/diet instructions or null",
   "followup": "next visit/test instructions or null",
+  "followUpDate": "YYYY-MM-DD if the document states or clearly implies a specific next date/deadline, else null",
+  "followUpTitle": "short action label for the next step, e.g. 'Repeat LFT', 'Cardiology review', 'Echocardiogram' or null",
   "tags": ["2-3 short relevant tags, max 3"],
   "amount": null,
   "billItems": []
@@ -721,6 +760,20 @@ async function saveUploadRecord(memberId) {
     const saved = await db.addRecord(state.session.user.id, rec);
     // Remember this member as the default for the next upload
     state.lastUploadMemberId = memberId;
+    // If the AI found a next-action, create a follow-up (marked suggested unless a firm date was given)
+    if (ext.followUpTitle || ext.followUpDate || ext.followup) {
+      try {
+        await db.addFollowup(state.session.user.id, {
+          mid: memberId,
+          title: ext.followUpTitle || ext.followup || 'Follow-up',
+          kind: 'review',
+          dueDate: ext.followUpDate || null,
+          dateSource: ext.followUpDate ? 'explicit' : 'suggested',
+          notes: ext.followup && ext.followUpTitle ? ext.followup : null,
+          sourceRecordId: saved.id,
+        });
+      } catch (e) { /* non-fatal */ }
+    }
     // Switch active profile to the filed member so its episodes are in context for threading
     if (memberId !== state.currentId) { await switchMember(memberId); }
     // Refresh family-wide records so the Records page shows the new doc immediately
@@ -1792,6 +1845,143 @@ function renderMemberEditor() {
   </div>`;
 }
 
+// ═════════════════════════════════════════
+//  LAYER 3 — FOLLOW-UPS (dated next-actions)
+// ═════════════════════════════════════════
+const FU_KINDS = { test:{label:'Test',icon:'flask-conical'}, review:{label:'Review',icon:'stethoscope'}, medication:{label:'Medication',icon:'pill'}, procedure:{label:'Procedure',icon:'activity'}, other:{label:'Other',icon:'bell'} };
+function fuKind(k){ return FU_KINDS[k] || FU_KINDS.other; }
+
+function daysUntil(dateStr) {
+  if (!dateStr) return null;
+  const d = new Date(dateStr); if (isNaN(d)) return null;
+  const today = new Date(); today.setHours(0,0,0,0); d.setHours(0,0,0,0);
+  return Math.round((d - today) / 86400000);
+}
+function fmtRelDate(dateStr) {
+  const n = daysUntil(dateStr);
+  if (n === null) return 'No date set';
+  if (n < 0) return `${Math.abs(n)} day${Math.abs(n)!==1?'s':''} overdue`;
+  if (n === 0) return 'Today';
+  if (n === 1) return 'Tomorrow';
+  if (n <= 7) return `In ${n} days`;
+  if (n <= 31) return `In ${Math.round(n/7)} week${Math.round(n/7)!==1?'s':''}`;
+  return new Date(dateStr).toLocaleDateString('en-IN', { day:'numeric', month:'short', year:'numeric' });
+}
+function fuBucket(dateStr) {
+  const n = daysUntil(dateStr);
+  if (n === null) return 'nodate';
+  if (n < 0) return 'overdue';
+  if (n <= 7) return 'week';
+  if (n <= 31) return 'month';
+  return 'later';
+}
+// Google Calendar template URL (zero-setup: opens a prefilled event to save)
+function gcalUrl(f, member) {
+  const d = f.dueDate ? new Date(f.dueDate) : new Date();
+  const y = d.getFullYear(), mo = String(d.getMonth()+1).padStart(2,'0'), da = String(d.getDate()).padStart(2,'0');
+  const start = `${y}${mo}${da}`;
+  const d2 = new Date(d); d2.setDate(d2.getDate()+1);
+  const end = `${d2.getFullYear()}${String(d2.getMonth()+1).padStart(2,'0')}${String(d2.getDate()).padStart(2,'0')}`;
+  const text = encodeURIComponent(`${f.title}${member?` — ${member.name.split(' ')[0]}`:''} (HealthHub)`);
+  const details = encodeURIComponent(`${fuKind(f.kind).label} for ${member?member.name:'family member'}.${f.notes?'\n'+f.notes:''}\n\nvia HealthHub`);
+  return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${text}&dates=${start}/${end}&details=${details}`;
+}
+
+const FU_BUCKETS = [
+  { id:'overdue', label:'Overdue', cls:'text-rose-600' },
+  { id:'week', label:'This week', cls:'text-amber-600' },
+  { id:'month', label:'This month', cls:'text-teal-700' },
+  { id:'later', label:'Later', cls:'text-stone-500' },
+  { id:'nodate', label:'No date yet', cls:'text-stone-400' },
+];
+
+function renderUpcoming() {
+  const scopeId = state.familyView ? null : state.currentId;
+  const pending = state.allFollowups.filter(f => f.status === 'pending' && (!scopeId || f.mid === scopeId));
+  const scopeLabel = scopeId ? (memberById(scopeId)?.name.split(' ')[0] || '') : 'the whole family';
+
+  const fuCard = (f) => {
+    const mem = memberById(f.mid);
+    const k = fuKind(f.kind);
+    const rel = fmtRelDate(f.dueDate);
+    const overdue = fuBucket(f.dueDate) === 'overdue';
+    return `<div class="bg-white rounded-2xl p-3.5 border border-stone-100 shadow-sm">
+      <div class="flex items-start gap-3">
+        <div class="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml(k.icon,17,'')}</div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2"><p class="font-bold text-stone-900 text-sm">${esc(f.title)}</p>${f.dateSource==='suggested'?badgeHtml('AI suggested','bg-amber-50 text-amber-700 ml-auto text-xs'):''}</div>
+          <div class="flex items-center gap-1.5 mt-1">
+            ${mem?`<span class="inline-flex items-center gap-1"><span class="w-4 h-4 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:9px;font-weight:800">${mem.avatar}</span><span class="text-xs font-semibold text-stone-500">${esc(mem.name.split(' ')[0])}</span></span><span class="text-stone-300 text-xs">·</span>`:''}
+            <span class="text-xs font-semibold ${overdue?'text-rose-600':'text-stone-500'}">${rel}</span>
+          </div>
+          ${f.notes?`<p class="text-xs text-stone-500 mt-1 line-clamp-1">${esc(f.notes)}</p>`:''}
+          ${f.dateSource==='suggested'?`<p class="text-xs text-amber-600 mt-1">Confirm this with the doctor</p>`:''}
+        </div>
+      </div>
+      <div class="flex gap-2 mt-2.5 pl-12">
+        <button data-action="followup-done" data-id="${f.id}" class="flex-1 py-1.5 rounded-lg text-xs font-bold text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('check',12,'inline mr-1')}Mark done</button>
+        <button data-action="followup-calendar" data-id="${f.id}" class="flex-1 py-1.5 rounded-lg text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50">${iconHtml('calendar',12,'inline mr-1')}Calendar</button>
+        <button data-action="followup-edit" data-id="${f.id}" class="px-2.5 py-1.5 rounded-lg border border-stone-200 text-stone-400 hover:bg-stone-50">${iconHtml('pencil',12)}</button>
+      </div>
+    </div>`;
+  };
+
+  const body = pending.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('calendar-check',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">Nothing coming up</p><p class="text-sm mt-1">Follow-ups from your documents show here, or add one manually.</p></div>`
+    : FU_BUCKETS.map(b => {
+        const items = pending.filter(f => fuBucket(f.dueDate) === b.id);
+        if (items.length === 0) return '';
+        return `<div class="mb-5">
+          <div class="flex items-center gap-2 mb-2"><p class="text-xs font-black uppercase tracking-wider ${b.cls}">${b.label}</p><span class="text-xs text-stone-300">${items.length}</span><div class="flex-1 h-px bg-stone-100"></div></div>
+          <div class="space-y-2.5">${items.map(fuCard).join('')}</div>
+        </div>`;
+      }).join('');
+
+  return `<div class="fade-in max-w-2xl">
+    <div class="flex items-center justify-between mb-1">
+      <h1 class="text-xl md:text-2xl font-bold text-stone-900">What's Coming Up</h1>
+      <button data-action="followup-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add</button>
+    </div>
+    <p class="text-xs text-stone-400 mb-4">${pending.length} pending for ${esc(scopeLabel)}</p>
+    ${body}
+  </div>`;
+}
+
+function renderFollowupEditor() {
+  const ed = state.followupEditor;
+  if (!ed) return '';
+  const isEdit = !!ed.id;
+  return `
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="followup-editor-backdrop">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-6 shadow-2xl max-h-[90dvh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-4"><h3 class="font-bold text-stone-900 text-lg">${isEdit?'Edit Follow-up':'New Follow-up'}</h3><button data-action="close-followup-editor">${iconHtml('x',18,'text-stone-400')}</button></div>
+      <div class="space-y-3">
+        <div><label class="block text-xs font-bold text-stone-500 mb-1">What needs doing? *</label>
+          <input id="fu-title" value="${esc(ed.title||'')}" placeholder="e.g. Repeat LFT, Cardiology review" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>
+        <div><label class="block text-xs font-bold text-stone-500 mb-1">For whom *</label>
+          <select id="fu-member" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
+            ${activeMembers().map(mm=>`<option value="${mm.id}" ${ed.mid===mm.id?'selected':''}>${esc(mm.name)}</option>`).join('')}
+          </select></div>
+        <div class="grid grid-cols-2 gap-3">
+          <div><label class="block text-xs font-bold text-stone-500 mb-1">Due date</label>
+            <input id="fu-date" type="date" value="${ed.dueDate||''}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>
+          <div><label class="block text-xs font-bold text-stone-500 mb-1">Type</label>
+            <select id="fu-kind" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
+              ${Object.keys(FU_KINDS).map(k=>`<option value="${k}" ${ (ed.kind||'review')===k?'selected':''}>${FU_KINDS[k].label}</option>`).join('')}
+            </select></div>
+        </div>
+        <div><label class="block text-xs font-bold text-stone-500 mb-1">Notes (optional)</label>
+          <textarea id="fu-notes" rows="2" placeholder="Any detail" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 resize-none">${esc(ed.notes||'')}</textarea></div>
+      </div>
+      <div class="flex gap-3 mt-5">
+        ${isEdit?`<button data-action="followup-delete" data-id="${ed.id}" class="py-3 px-4 border border-rose-200 text-rose-600 rounded-xl text-sm font-bold hover:bg-rose-50">${iconHtml('trash-2',15)}</button>`:''}
+        <button data-action="close-followup-editor" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
+        <button id="fu-save" class="flex-1 py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}" ${state.followupSaving?'disabled':''}>${state.followupSaving?spinnerHtml(15,'text-white'):''} ${isEdit?'Save':'Add Follow-up'}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 // ── Settings page ──
 function renderSettings() {
   const email = state.session?.user?.email || '';
@@ -1841,6 +2031,7 @@ function renderSettings() {
 const NAV = [
   { id:'dashboard', label:'Dashboard', icon:'home' },
   { id:'records', label:'Medical Records', icon:'file-text' },
+  { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
   { id:'healthplan', label:'Health Plan', icon:'target' },
   { id:'dailylog', label:'Daily Log', icon:'book-open' },
   { id:'spending', label:'Spending', icon:'dollar-sign' },
@@ -1852,10 +2043,11 @@ const NAV = [
 const MOBILE_MAIN = [
   { id:'dashboard', label:'Home', icon:'home' },
   { id:'records', label:'Records', icon:'file-text' },
+  { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
   { id:'aidoctor', label:'AI Doctor', icon:'brain' },
-  { id:'dailylog', label:'Log', icon:'pencil' },
 ];
 const MOBILE_MORE = [
+  { id:'dailylog', label:'Daily Log', icon:'pencil', desc:'Log today' },
   { id:'healthplan', label:'Health Plan', icon:'target', desc:'Diet, meds, tests' },
   { id:'spending', label:'Spending', icon:'dollar-sign', desc:'Bills, savings' },
   { id:'metrics', label:'Metrics', icon:'activity', desc:'BP, weight, steps' },
@@ -1950,6 +2142,7 @@ function renderPageContent() {
   switch (state.page) {
     case 'dashboard': return renderDashboard();
     case 'records': return renderRecords();
+    case 'upcoming': return renderUpcoming();
     case 'healthplan': return renderHealthPlan();
     case 'dailylog': return renderDailyLog();
     case 'spending': return renderSpending();
@@ -1985,6 +2178,7 @@ function renderMainApp() {
     ${state.fileModal ? renderFileModal() : ''}
     ${state.episodeEditor ? renderEpisodeEditor() : ''}
     ${state.memberEditor ? renderMemberEditor() : ''}
+    ${state.followupEditor ? renderFollowupEditor() : ''}
   `;
   return `<div class="flex h-screen bg-stone-50 overflow-hidden" id="app-root">
     ${renderSidebar()}
@@ -2072,6 +2266,29 @@ document.addEventListener('click', async (e) => {
     case 'view-family':
       setState({ familyView: true, memberMenuOpen: false });
       break;
+    // ── Follow-ups (Layer 3) ──
+    case 'followup-add':
+      setState({ followupEditor: { mid: state.familyView ? (activeMembers()[0]?.id) : state.currentId, kind: 'review', title: '', dueDate: '', notes: '' } });
+      break;
+    case 'followup-edit': {
+      const f = state.allFollowups.find(x => x.id === el.dataset.id);
+      if (f) setState({ followupEditor: { id: f.id, mid: f.mid, kind: f.kind, title: f.title, dueDate: f.dueDate || '', notes: f.notes || '' } });
+      break;
+    }
+    case 'close-followup-editor':
+      setState({ followupEditor: null });
+      break;
+    case 'followup-done':
+      await handleFollowupDone(el.dataset.id);
+      break;
+    case 'followup-delete':
+      await handleFollowupDelete(el.dataset.id);
+      break;
+    case 'followup-calendar': {
+      const f = state.allFollowups.find(x => x.id === el.dataset.id);
+      if (f) { window.open(gcalUrl(f, memberById(f.mid)), '_blank'); }
+      break;
+    }
     case 'pick-person':
       state.familyView = false;
       await switchMember(el.dataset.id);
@@ -2256,6 +2473,7 @@ document.addEventListener('click', async (e) => {
   if (e.target.id === 'ob-save') handleOnboardingSave();
   if (e.target.id === 'am-save') handleAddMemberSave();
   if (e.target.id === 'me-save') handleSaveMember();
+  if (e.target.id === 'fu-save') handleSaveFollowup();
   if (e.target.id === 'dl-save') handleSaveDailyLog();
   if (e.target.id === 'metric-save') handleSaveMetric();
   if (e.target.id === 'ep-save') handleSaveEpisode();
@@ -2335,8 +2553,12 @@ async function loadMemberData(memberId) {
 async function loadFamilyData() {
   if (!state.session) return;
   try {
-    const [allRecords, allEpisodes] = await Promise.all([db.getAllRecords(state.session.user.id), db.getAllEpisodes(state.session.user.id)]);
-    setState({ allRecords, allEpisodes });
+    const [allRecords, allEpisodes, allFollowups] = await Promise.all([
+      db.getAllRecords(state.session.user.id),
+      db.getAllEpisodes(state.session.user.id),
+      db.getAllFollowups(state.session.user.id),
+    ]);
+    setState({ allRecords, allEpisodes, allFollowups });
   } catch (e) { console.error(e); }
 }
 // Look up a record family-wide (falls back to current-member list)
@@ -2502,6 +2724,51 @@ async function handleSaveMember() {
 
 async function reloadMembers() {
   try { state.members = await db.getMembers(state.session.user.id); } catch (e) { console.error(e); }
+}
+
+// ── Follow-up handlers (Layer 3) ──
+async function handleSaveFollowup() {
+  const ed = state.followupEditor;
+  const val = k => document.getElementById('fu-' + k)?.value;
+  const title = (val('title') || '').trim();
+  const mid = val('member');
+  if (!title) { showToast('Please enter what needs doing'); return; }
+  if (!mid) { showToast('Please pick a person'); return; }
+  setState({ followupSaving: true });
+  try {
+    if (ed.id) {
+      await db.updateFollowup(ed.id, { title, kind: val('kind'), dueDate: val('date') || null, notes: (val('notes') || '').trim() });
+    } else {
+      await db.addFollowup(state.session.user.id, { mid, title, kind: val('kind') || 'review', dueDate: val('date') || null, dateSource: 'explicit', notes: (val('notes') || '').trim() });
+    }
+    await loadFamilyData();
+    setState({ followupSaving: false, followupEditor: null });
+    showToast(ed.id ? 'Follow-up updated ✓' : 'Follow-up added ✓');
+  } catch (e) { setState({ followupSaving: false }); showToast('Could not save — try again'); }
+}
+
+async function handleFollowupDone(id) {
+  const f = state.allFollowups.find(x => x.id === id);
+  try {
+    await db.updateFollowup(id, { status: 'done', completedOn: new Date().toISOString().slice(0,10) });
+    // Recurring follow-up → schedule the next occurrence automatically
+    if (f && f.recurring && f.recurMonths && f.dueDate) {
+      const next = new Date(f.dueDate); next.setMonth(next.getMonth() + f.recurMonths);
+      await db.addFollowup(state.session.user.id, { mid: f.mid, title: f.title, kind: f.kind, dueDate: next.toISOString().slice(0,10), dateSource: 'explicit', recurring: true, recurMonths: f.recurMonths, episodeId: f.episodeId });
+    }
+    await loadFamilyData();
+    setState({});
+    showToast('Marked done ✓');
+  } catch (e) { showToast('Could not update — try again'); }
+}
+
+async function handleFollowupDelete(id) {
+  try {
+    await db.deleteFollowup(id);
+    await loadFamilyData();
+    setState({ followupEditor: null });
+    showToast('Follow-up removed');
+  } catch (e) { showToast('Could not remove — try again'); }
 }
 
 async function handleArchiveMember(id, archived) {

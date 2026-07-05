@@ -59,6 +59,7 @@ let state = {
   memberSaving: false,
   memberMenuFor: null,        // memberId whose ⋯ menu is open on the Family page
   movePatientFor: null,       // recordId whose "change patient" picker is open
+  editingRecordDate: null,    // recordId whose date is being edited inline
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -303,6 +304,13 @@ const db = {
   async setRecordMember(recordId, memberId) {
     // Threads are family-level folders, so moving a record to another person keeps its thread.
     const { error } = await supabaseClient.from('medical_records').update({ member_id: memberId }).eq('id', recordId);
+    if (error) throw error;
+  },
+  async updateRecordFields(recordId, patch) {
+    const upd = {};
+    const map = { date:'date', title:'title', doctor:'doctor', hospital:'hospital', amount:'amount', summary:'summary' };
+    for (const k in patch) if (map[k]) upd[map[k]] = patch[k];
+    const { error } = await supabaseClient.from('medical_records').update(upd).eq('id', recordId);
     if (error) throw error;
   },
   // ── Episodes ──
@@ -1101,7 +1109,7 @@ function renderRecords() {
         ${(() => { const ts = typeStyle(sel.type); return `<div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-3">${iconHtml(ts.icon,16)}<span>${ts.label}</span>${sel.source==='upload'?badgeHtml('AI','ml-auto bg-teal-100 text-teal-700 text-xs'):''}</div>`; })()}
         ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
         <div class="space-y-2.5 text-sm">
-          ${[{l:'Date',v:fmtDate(sel.date)},{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+          ${dateEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
         </div>
         ${sel.extracted ? `<div class="mt-4 pt-4 border-t border-stone-100 space-y-3">
           <p class="text-xs font-bold text-stone-400 uppercase tracking-wider">AI Extracted</p>
@@ -1295,6 +1303,21 @@ function renderEpisodeDetail() {
   </div>`;
 }
 
+// Editable document-date row (used in record detail). Lets you correct a mis-read date.
+function dateEditRowHtml(sel) {
+  if (state.editingRecordDate === sel.id) {
+    return `<div class="p-2.5 bg-teal-50 rounded-xl">
+      <p class="text-xs font-bold text-teal-700 mb-1.5">Edit document date</p>
+      <div class="flex gap-2">
+        <input id="record-date-input" type="date" value="${sel.date || ''}" class="flex-1 px-3 py-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/>
+        <button data-action="save-record-date" data-id="${sel.id}" class="px-3 py-2 rounded-lg text-xs font-bold text-white" style="background:${C.teal}">Save</button>
+        <button data-action="cancel-record-date" class="px-3 py-2 rounded-lg text-xs font-bold border border-stone-200 text-stone-500">Cancel</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="flex items-center justify-between"><div><p class="text-xs text-stone-400">Date</p><p class="font-semibold text-stone-800">${fmtDate(sel.date)}</p></div><button data-action="edit-record-date" data-id="${sel.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400" title="Edit date">${iconHtml('pencil',13)}</button></div>`;
+}
+
 // A lightweight record-detail modal (used from episode view where there's no side panel)
 function renderRecordDetailModal(sel) {
   const ts = typeStyle(sel.type);
@@ -1317,7 +1340,7 @@ function renderRecordDetailModal(sel) {
       ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
 
       <div class="space-y-2.5 text-sm">
-        ${[{l:'Date',v:fmtDate(sel.date)},{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+        ${dateEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
       </div>
       ${sel.summary?`<div class="mt-3 p-3 bg-teal-50 rounded-xl"><p class="text-xs font-bold text-teal-700 mb-0.5">Summary</p><p class="text-sm text-teal-800">${esc(sel.summary)}</p></div>`:''}
       ${ex.diagnosis?`<div class="mt-3"><p class="text-xs text-stone-400">Diagnosis</p><p class="text-sm text-stone-800">${esc(ex.diagnosis)}</p></div>`:''}
@@ -1963,7 +1986,7 @@ function renderFollowupEditor() {
             ${activeMembers().map(mm=>`<option value="${mm.id}" ${ed.mid===mm.id?'selected':''}>${esc(mm.name)}</option>`).join('')}
           </select></div>
         <div class="grid grid-cols-2 gap-3">
-          <div><label class="block text-xs font-bold text-stone-500 mb-1">Due date</label>
+          <div><label class="block text-xs font-bold text-stone-500 mb-1">Due date <span class="font-normal text-stone-400">(optional)</span></label>
             <input id="fu-date" type="date" value="${ed.dueDate||''}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>
           <div><label class="block text-xs font-bold text-stone-500 mb-1">Type</label>
             <select id="fu-kind" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
@@ -2419,6 +2442,15 @@ document.addEventListener('click', async (e) => {
     case 'move-patient':
       setState({ movePatientFor: state.movePatientFor === el.dataset.id ? null : el.dataset.id });
       break;
+    case 'edit-record-date':
+      setState({ editingRecordDate: el.dataset.id });
+      break;
+    case 'cancel-record-date':
+      setState({ editingRecordDate: null });
+      break;
+    case 'save-record-date':
+      await handleSaveRecordDate(el.dataset.id);
+      break;
     case 'do-move-patient':
       await handleMovePatient(el.dataset.record, el.dataset.member);
       break;
@@ -2598,6 +2630,19 @@ async function handleMovePatient(recordId, memberId) {
     setState({ movePatientFor: null, recordSelectedId: null, records: state.records.filter(r => r.id !== recordId) });
     showToast(`Moved to ${mem ? mem.name.split(' ')[0] : 'member'} ✓`);
   } catch (e) { showToast('Could not move — try again'); }
+}
+
+async function handleSaveRecordDate(recordId) {
+  const newDate = document.getElementById('record-date-input')?.value;
+  if (!newDate) { showToast('Please pick a date'); return; }
+  try {
+    await db.updateRecordFields(recordId, { date: newDate });
+    await loadFamilyData();
+    // keep local per-member list in sync
+    const patch = r => r.id === recordId ? { ...r, date: newDate } : r;
+    setState({ editingRecordDate: null, records: state.records.map(patch) });
+    showToast('Date updated ✓');
+  } catch (e) { showToast('Could not update date — try again'); }
 }
 
 // Silently remove empty (0-document) threads. Runs automatically when you ENTER the thread view,

@@ -61,6 +61,7 @@ let state = {
   movePatientFor: null,       // recordId whose "change patient" picker is open
   editingRecordDate: null,    // recordId whose date is being edited inline
   editingRecordAmount: null,  // recordId whose amount is being edited inline
+  spendFilter: 'all',         // Spending page claim-status filter
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -210,7 +211,7 @@ const db = {
       tags: r.tags || [], priority: r.priority || 'medium', source: r.source || 'manual',
       uploadedFile: r.uploaded_file_name, filePath: r.file_path,
       patientNameOnDoc: r.patient_name_on_doc, extracted: r.extracted_data || {},
-      episodeId: r.episode_id || null,
+      episodeId: r.episode_id || null, claimStatus: r.claim_status || 'none',
     }));
   },
   async getAllEpisodes(userId) {
@@ -279,7 +280,7 @@ const db = {
       tags: r.tags || [], priority: r.priority || 'medium', source: r.source || 'manual',
       uploadedFile: r.uploaded_file_name, filePath: r.file_path,
       patientNameOnDoc: r.patient_name_on_doc, extracted: r.extracted_data || {},
-      episodeId: r.episode_id || null,
+      episodeId: r.episode_id || null, claimStatus: r.claim_status || 'none',
     }));
   },
   async addRecord(userId, rec) {
@@ -309,7 +310,7 @@ const db = {
   },
   async updateRecordFields(recordId, patch) {
     const upd = {};
-    const map = { date:'date', title:'title', doctor:'doctor', hospital:'hospital', amount:'amount', summary:'summary' };
+    const map = { date:'date', title:'title', doctor:'doctor', hospital:'hospital', amount:'amount', summary:'summary', claimStatus:'claim_status' };
     for (const k in patch) if (map[k]) upd[map[k]] = patch[k];
     const { error } = await supabaseClient.from('medical_records').update(upd).eq('id', recordId);
     if (error) throw error;
@@ -1672,56 +1673,92 @@ async function handleSaveDailyLog() {
 // ─────────────────────────────────────────
 //  SPENDING
 // ─────────────────────────────────────────
+const CLAIM_STATES = {
+  none:     { label:'Not insurance', short:'—',        cls:'bg-stone-100 text-stone-400', next:'to_claim' },
+  to_claim: { label:'To claim',      short:'To claim', cls:'bg-amber-100 text-amber-700', next:'claimed' },
+  claimed:  { label:'Claimed',       short:'Claimed',  cls:'bg-emerald-100 text-emerald-700', next:'none' },
+};
+const SPEND_FILTERS = [
+  { id:'all', label:'All' },
+  { id:'to_claim', label:'To claim' },
+  { id:'claimed', label:'Claimed' },
+  { id:'none', label:'Not insurance' },
+];
+
 function renderSpending() {
-  return `<div class="space-y-4 fade-in">
+  const scopeId = state.familyView ? null : state.currentId;
+  const scopeLabel = scopeId ? (memberById(scopeId)?.name.split(' ')[0] || '') : 'Whole family';
+  // Only records that carry an amount are transactions
+  let txns = state.allRecords.filter(r => r.amount != null && r.amount > 0 && (!scopeId || r.mid === scopeId));
+  const filter = state.spendFilter || 'all';
+  if (filter !== 'all') txns = txns.filter(r => (r.claimStatus || 'none') === filter);
+  txns = txns.slice().sort((a,b) => new Date(b.date) - new Date(a.date));
+
+  // Totals from the scope (before the claim filter, so the cards stay stable)
+  const scoped = state.allRecords.filter(r => r.amount != null && r.amount > 0 && (!scopeId || r.mid === scopeId));
+  const total = scoped.reduce((s,r) => s + r.amount, 0);
+  const toClaim = scoped.filter(r => r.claimStatus === 'to_claim').reduce((s,r) => s + r.amount, 0);
+  const now = new Date();
+  const thisMonth = scoped.filter(r => { const d = new Date(r.date); return d.getMonth()===now.getMonth() && d.getFullYear()===now.getFullYear(); }).reduce((s,r)=>s+r.amount,0);
+
+  const grouped = {};
+  txns.forEach(r => {
+    const d = new Date(r.date);
+    const key = isNaN(d) ? 'Undated' : d.toLocaleDateString('en-IN', { month:'long', year:'numeric' });
+    (grouped[key] = grouped[key] || []).push(r);
+  });
+
+  const listHtml = txns.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('receipt',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No spending recorded${filter!=='all'?' in this filter':''}</p><p class="text-sm mt-1">Amounts from your bills show here. Add or edit an amount on any record.</p></div>`
+    : Object.keys(grouped).map(month => {
+        const items = grouped[month];
+        const monthTotal = items.reduce((s,r)=>s+r.amount,0);
+        return `<div class="mb-4">
+          <div class="flex items-center gap-2 mb-2">
+            <p class="text-xs font-black text-stone-400 uppercase tracking-wider">${month}</p>
+            <div class="flex-1 h-px bg-stone-100"></div>
+            <p class="text-xs font-bold text-stone-500">${fmtINR(monthTotal)}</p>
+          </div>
+          <div class="space-y-2">
+            ${items.map(r => { const mem = memberById(r.mid); const cs = CLAIM_STATES[r.claimStatus||'none']; const ts = typeStyle(r.type); return `
+              <div class="bg-white rounded-xl p-3 border border-stone-100 shadow-sm flex items-center gap-3">
+                <div class="p-2 rounded-lg ${ts.bg} ${ts.text} flex-shrink-0 cursor-pointer" data-action="select-record" data-id="${r.id}">${iconHtml(ts.icon,15)}</div>
+                <div class="flex-1 min-w-0 cursor-pointer" data-action="select-record" data-id="${r.id}">
+                  <p class="font-bold text-stone-900 text-sm truncate">${esc(r.title)}</p>
+                  <div class="flex items-center gap-1.5 mt-0.5">
+                    ${mem?`<span class="inline-flex items-center gap-1"><span class="w-3.5 h-3.5 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:8px;font-weight:800">${mem.avatar}</span><span class="text-xs font-semibold text-stone-500">${esc(mem.name.split(' ')[0])}</span></span><span class="text-stone-300 text-xs">·</span>`:''}
+                    <span class="text-xs text-stone-400">${fmtDate(r.date)}</span>
+                  </div>
+                </div>
+                <div class="text-right flex-shrink-0">
+                  <p class="font-black text-stone-900 text-sm">${fmtINR(r.amount)}</p>
+                  <button data-action="cycle-claim" data-id="${r.id}" class="mt-1 text-xs font-bold px-2 py-0.5 rounded-full ${cs.cls}" title="Tap to change claim status">${cs.short}</button>
+                </div>
+              </div>`; }).join('')}
+          </div>
+        </div>`;
+      }).join('');
+
+  return `<div class="fade-in max-w-2xl">
+    ${(() => { const sel = anyRecord(state.recordSelectedId); return sel ? renderRecordDetailModal(sel) : ''; })()}
     <h1 class="text-xl md:text-2xl font-bold text-stone-900">Health Spending</h1>
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
-      ${[{l:'This Month',v:'₹1,800',s:'↓ 56% vs April',sc:'text-emerald-600'},{l:'This Year',v:'₹17,800',s:'7 months tracked',sc:'text-stone-400'},{l:'Monthly Avg',v:'₹2,371',s:'All months',sc:'text-stone-400'},{l:'Claim Pending',v:'₹2,800',s:'File today – urgent',sc:'text-amber-600',hi:true}].map(st=>`
-        <div class="bg-white rounded-2xl border shadow-sm p-4 ${st.hi?'bg-amber-50/40 border-amber-100':'border-stone-100'}">
-          <p class="text-xs font-bold uppercase tracking-wide mb-2 ${st.hi?'text-amber-600':'text-stone-400'}">${st.l}</p>
-          <p class="text-2xl font-black ${st.hi?'text-amber-700':'text-stone-900'}">${st.v}</p>
-          <p class="text-xs font-semibold mt-1 ${st.sc}">${st.s}</p>
-        </div>`).join('')}
+    <p class="text-xs text-stone-400 mb-4">${esc(scopeLabel)} · tap a claim tag to mark it</p>
+
+    <div class="grid grid-cols-3 gap-3 mb-4">
+      <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-3"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-1">Total</p><p class="text-lg font-black text-stone-900">${fmtINR(total)}</p></div>
+      <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-3"><p class="text-xs font-bold text-stone-400 uppercase tracking-wide mb-1">This month</p><p class="text-lg font-black text-stone-900">${fmtINR(thisMonth)}</p></div>
+      <div class="bg-amber-50 rounded-2xl border border-amber-100 shadow-sm p-3"><p class="text-xs font-bold text-amber-600 uppercase tracking-wide mb-1">To claim</p><p class="text-lg font-black text-amber-700">${fmtINR(toClaim)}</p></div>
     </div>
-    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-      <div class="lg:col-span-2">${cardOpen('p-4')}<p class="font-bold text-stone-900 mb-4">Monthly Breakdown (₹)</p><canvas id="chart-spend-monthly" height="200"></canvas></div></div>
-      ${cardOpen('p-4')}<p class="font-bold text-stone-900 mb-3">Category Split</p><canvas id="chart-spend-cats" height="150"></canvas>
-        <div class="space-y-1.5 mt-2">${SPEND_CATS.map(c=>`<div class="flex items-center justify-between text-sm"><div class="flex items-center gap-2"><div class="w-2.5 h-2.5 rounded-full" style="background:${c.color}"></div><span class="text-stone-600">${c.name}</span></div><span class="font-bold">${fmtINR(c.value)}</span></div>`).join('')}</div>
-      </div>
+
+    <div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar mb-3">
+      ${SPEND_FILTERS.map(f=>`<button data-action="spend-filter" data-id="${f.id}" class="px-3 py-1.5 rounded-full text-xs font-bold whitespace-nowrap flex-shrink-0 transition-colors" style="${filter===f.id?`background:${C.teal};color:white`:'background:white;color:#78716c;border:1px solid #e7e5e4'}">${f.label}</button>`).join('')}
     </div>
-    ${cardOpen('p-4')}
-      <div class="flex items-center gap-2 mb-4">${iconHtml('star',16,'text-amber-500')}<p class="font-bold text-stone-900">Savings Opportunities</p></div>
-      ${[{t:'Switch to generic Amlodipine – same molecule, ~60% cheaper',s:200},{t:'Annual preventive health package vs individual tests – saves ~30%',s:840},{t:'File insurance claim for April lab tests (₹2,800 eligible) – Urgent!',s:2800},{t:'Bulk 3-month Metformin from Jan Aushadhi store',s:360}].map((item,i)=>`
-        <div class="flex items-start gap-3 p-3.5 bg-amber-50 rounded-xl mb-2"><div class="w-6 h-6 bg-amber-200 rounded-full flex items-center justify-center text-xs font-black text-amber-800 flex-shrink-0">${i+1}</div><span class="text-sm text-stone-800 flex-1">${item.t}</span><p class="text-sm font-black text-emerald-600 flex-shrink-0">Save ${fmtINR(item.s)}</p></div>`).join('')}
-      <div class="p-3.5 bg-emerald-50 border border-emerald-100 rounded-xl flex justify-between"><p class="text-sm font-bold text-emerald-800">Total potential savings</p><p class="text-lg font-black text-emerald-700">₹4,200</p></div>
-    </div>
+
+    ${listHtml}
   </div>`;
 }
 function destroyChart(id) { if (chartRegistry[id]) { chartRegistry[id].destroy(); delete chartRegistry[id]; } }
-function mountSpendingCharts() {
-  const c1 = document.getElementById('chart-spend-monthly');
-  if (c1) {
-    destroyChart('chart-spend-monthly');
-    chartRegistry['chart-spend-monthly'] = new Chart(c1, {
-      type: 'bar',
-      data: { labels: SPEND_SAMPLE.map(d=>d.month), datasets: [
-        { label:'Medicines', data: SPEND_SAMPLE.map(d=>d.medicines), backgroundColor: C.violet },
-        { label:'Lab Tests', data: SPEND_SAMPLE.map(d=>d.tests), backgroundColor: C.teal },
-        { label:'Consultations', data: SPEND_SAMPLE.map(d=>d.consult), backgroundColor: C.amber },
-      ]},
-      options: { responsive:true, maintainAspectRatio:false, scales:{x:{stacked:true},y:{stacked:true}}, plugins:{tooltip:{callbacks:{label:c=>`${c.dataset.label}: ${fmtINR(c.raw)}`}}} }
-    });
-  }
-  const c2 = document.getElementById('chart-spend-cats');
-  if (c2) {
-    destroyChart('chart-spend-cats');
-    chartRegistry['chart-spend-cats'] = new Chart(c2, {
-      type: 'doughnut',
-      data: { labels: SPEND_CATS.map(c=>c.name), datasets: [{ data: SPEND_CATS.map(c=>c.value), backgroundColor: SPEND_CATS.map(c=>c.color) }] },
-      options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false},tooltip:{callbacks:{label:c=>fmtINR(c.raw)}}} }
-    });
-  }
-}
+function mountSpendingCharts() { /* Spending is now a transaction list — no charts */ }
 
 // ─────────────────────────────────────────
 //  AI DOCTOR
@@ -2728,6 +2765,12 @@ document.addEventListener('click', async (e) => {
     case 'save-record-amount':
       await handleSaveRecordAmount(el.dataset.id);
       break;
+    case 'spend-filter':
+      setState({ spendFilter: el.dataset.id });
+      break;
+    case 'cycle-claim':
+      await handleCycleClaim(el.dataset.id);
+      break;
     case 'do-move-patient':
       await handleMovePatient(el.dataset.record, el.dataset.member);
       break;
@@ -2933,6 +2976,19 @@ async function handleSaveRecordAmount(recordId) {
     setState({ editingRecordAmount: null, records: state.records.map(patch) });
     showToast('Amount updated ✓');
   } catch (e) { showToast('Could not update amount — try again'); }
+}
+
+async function handleCycleClaim(recordId) {
+  const rec = anyRecord(recordId);
+  if (!rec) return;
+  const next = (CLAIM_STATES[rec.claimStatus || 'none'] || CLAIM_STATES.none).next;
+  try {
+    await db.updateRecordFields(recordId, { claimStatus: next });
+    await loadFamilyData();
+    const patch = r => r.id === recordId ? { ...r, claimStatus: next } : r;
+    setState({ records: state.records.map(patch) });
+    showToast(next === 'none' ? 'Marked not-insurance' : next === 'to_claim' ? 'Marked to claim' : 'Marked claimed ✓');
+  } catch (e) { showToast('Could not update — try again'); }
 }
 
 // Silently remove empty (0-document) threads. Runs automatically when you ENTER the thread view,

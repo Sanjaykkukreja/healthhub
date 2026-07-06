@@ -60,6 +60,7 @@ let state = {
   memberMenuFor: null,        // memberId whose ⋯ menu is open on the Family page
   movePatientFor: null,       // recordId whose "change patient" picker is open
   editingRecordDate: null,    // recordId whose date is being edited inline
+  editingRecordAmount: null,  // recordId whose amount is being edited inline
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -795,7 +796,45 @@ async function saveUploadRecord(memberId) {
   }
 }
 
-// After an upload, decide what thread to propose and open the filing modal.
+// Save a manually-entered record (no AI). Used when AI fails/credit is out, or the user chooses to type it.
+async function handleSaveManual() {
+  const um = state.uploadModal;
+  const memberId = state.uploadTargetId;
+  if (!memberId) { showToast('Please pick a person'); return; }
+  const val = k => document.getElementById('man-' + k)?.value;
+  const title = (val('title') || '').trim();
+  const date = val('date');
+  if (!title) { showToast('Please enter a title'); return; }
+  if (!date) { showToast('Please enter a date'); return; }
+  setState({ uploadModal: { ...um, uploading: true } });
+  try {
+    let filePath = null, fileName = null;
+    if (um.file) {
+      filePath = await db.uploadFile(um.file, state.session.user.id);
+      fileName = um.file.name;
+    }
+    const amount = val('amount') ? parseFloat(val('amount')) : null;
+    const type = val('type') || 'report';
+    const rec = {
+      mid: memberId, date, type, title,
+      doctor: (val('doctor') || '').trim() || null, hospital: (val('hospital') || '').trim() || null,
+      amount, summary: (val('summary') || '').trim(), tags: [], priority: 'medium',
+      source: 'manual', uploadedFile: fileName, filePath, extracted: {},
+    };
+    const saved = await db.addRecord(state.session.user.id, rec);
+    state.lastUploadMemberId = memberId;
+    if (memberId !== state.currentId) { await switchMember(memberId); }
+    await loadFamilyData();
+    setState({ records: [saved, ...state.records.filter(r => r.id !== saved.id)], uploadModal: null });
+    showToast(`"${title}" saved ✓`);
+    // Offer to file into a thread
+    proposeEpisodeForRecord(saved, { threadTopic: '', diagnosis: title, tags: [] });
+  } catch (e) {
+    setState({ uploadModal: { ...um, uploading: false, phase: 'error', errMsg: e.message || 'Could not save' } });
+  }
+}
+
+
 // Match logic: if the diagnosis/tags/title strongly overlap an existing episode's
 // title, pre-select it; otherwise propose creating a new thread named after the diagnosis.
 function proposeEpisodeForRecord(saved, ext) {
@@ -849,6 +888,7 @@ function renderUploadModal() {
           </div>
         </div>
         <p class="text-xs text-stone-400 text-center">🔒 Files stored privately in your Supabase vault · Never shared</p>
+        <button data-action="upload-manual" class="w-full text-center text-xs font-bold text-teal-600 hover:underline pt-1">Or enter details manually (skip AI)</button>
       </div>`;
   } else if (um.phase === 'analysing') {
     body = `
@@ -917,13 +957,46 @@ function renderUploadModal() {
     body = `
       <div class="py-8 space-y-5 text-center">
         <div class="w-16 h-16 bg-rose-50 rounded-2xl flex items-center justify-center mx-auto">${iconHtml('alert-circle',28,'text-rose-500')}</div>
-        <div><p class="font-bold text-stone-900">Upload failed</p><p class="text-sm text-stone-400 mt-1.5 max-w-xs mx-auto">${esc(um.errMsg)}</p></div>
+        <div><p class="font-bold text-stone-900">AI couldn't read this</p><p class="text-sm text-stone-400 mt-1.5 max-w-xs mx-auto">${esc(um.errMsg)}</p></div>
         <div class="bg-stone-50 rounded-xl p-3 text-xs text-stone-500 text-left space-y-1">
-          <p class="font-semibold">Tips:</p><p>• Good lighting, document fills the frame</p><p>• PDF must not be password-protected</p><p>• Max 25 MB</p>
+          <p class="font-semibold">This can happen if the image is unclear, the file is large, or AI credit has run out. You can still save it — just type the details yourself.</p>
         </div>
-        <div class="flex gap-3">
+        <div class="space-y-2">
+          <button data-action="upload-manual" class="w-full py-3 text-white rounded-xl text-sm font-bold hover:opacity-90 flex items-center justify-center gap-2" style="background:${C.teal}">${iconHtml('pencil',15)} Enter details manually</button>
+          <div class="flex gap-3">
+            <button data-action="close-upload" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
+            <button data-action="retry-upload" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-600 hover:bg-stone-50">Retry AI</button>
+          </div>
+        </div>
+      </div>`;
+  } else if (um.phase === 'manual') {
+    const d = um.manual || {};
+    const fld = (id, label, ph='', type='text') => `<div><label class="block text-xs font-bold text-stone-500 mb-1">${label}</label><input id="man-${id}" type="${type}" value="${d[id]!=null?esc(String(d[id])):''}" placeholder="${ph}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>`;
+    body = `
+      <div class="space-y-3">
+        ${um.file?`<div class="flex items-center gap-2 px-3 py-2 bg-stone-50 rounded-xl text-xs text-stone-500">${iconHtml('file-text',13)}<span class="truncate flex-1">${esc(um.file.name)}</span><span>will be stored</span></div>`:`<div class="flex items-center gap-2 px-3 py-2 bg-stone-50 rounded-xl text-xs text-stone-400">${iconHtml('info',13)} No file attached — saving details only</div>`}
+        <div>
+          <label class="block text-xs font-bold text-stone-500 mb-1">Who is this for? *</label>
+          <div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
+            ${activeMembers().map(mem => `<button data-action="set-upload-target" data-id="${mem.id}" class="flex items-center gap-2 px-3 py-2 rounded-xl border-2 whitespace-nowrap flex-shrink-0 ${state.uploadTargetId===mem.id?'border-teal-400 bg-teal-50':'border-stone-200 bg-white'}"><div class="w-6 h-6 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:10px;font-weight:800">${mem.avatar}</div><span class="text-sm font-bold text-stone-800">${esc(mem.name.split(' ')[0])}</span>${state.uploadTargetId===mem.id?iconHtml('check',13,'text-teal-600'):''}</button>`).join('')}
+          </div>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          ${fld('title','Title *','e.g. LFT Report')}
+          <div><label class="block text-xs font-bold text-stone-500 mb-1">Type</label>
+            <select id="man-type" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
+              ${[['report','Lab report'],['prescription','Prescription'],['bill','Bill / invoice'],['xray','X-ray / scan'],['discharge','Discharge'],['other','Consultation / other']].map(([v,l])=>`<option value="${v}" ${ (d.type||'report')===v?'selected':''}>${l}</option>`).join('')}
+            </select></div>
+          ${fld('date','Date *','','date')}
+          ${fld('amount','Amount (₹)','e.g. 1250','number')}
+          ${fld('doctor','Doctor','optional')}
+          ${fld('hospital','Facility / lab','optional')}
+        </div>
+        <div><label class="block text-xs font-bold text-stone-500 mb-1">Note</label>
+          <textarea id="man-summary" rows="2" placeholder="What is this document about?" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 resize-none">${esc(d.summary||'')}</textarea></div>
+        <div class="flex gap-3 pt-1">
           <button data-action="close-upload" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
-          <button data-action="retry-upload" class="flex-1 py-3 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${C.teal}">Try Again</button>
+          <button id="man-save" ${um.uploading||!state.uploadTargetId?'disabled':''} class="flex-1 py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${um.uploading?spinnerHtml(15,'text-white'):''} ${um.uploading?'Saving…':'Save Record'}</button>
         </div>
       </div>`;
   }
@@ -1109,7 +1182,7 @@ function renderRecords() {
         ${(() => { const ts = typeStyle(sel.type); return `<div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-3">${iconHtml(ts.icon,16)}<span>${ts.label}</span>${sel.source==='upload'?badgeHtml('AI','ml-auto bg-teal-100 text-teal-700 text-xs'):''}</div>`; })()}
         ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
         <div class="space-y-2.5 text-sm">
-          ${dateEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+          ${dateEditRowHtml(sel)}${amountEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
         </div>
         ${sel.extracted ? `<div class="mt-4 pt-4 border-t border-stone-100 space-y-3">
           <p class="text-xs font-bold text-stone-400 uppercase tracking-wider">AI Extracted</p>
@@ -1318,6 +1391,21 @@ function dateEditRowHtml(sel) {
   return `<div class="flex items-center justify-between"><div><p class="text-xs text-stone-400">Date</p><p class="font-semibold text-stone-800">${fmtDate(sel.date)}</p></div><button data-action="edit-record-date" data-id="${sel.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400" title="Edit date">${iconHtml('pencil',13)}</button></div>`;
 }
 
+// Editable amount row (correct a mis-read bill, or add one manually — feeds Spending)
+function amountEditRowHtml(sel) {
+  if (state.editingRecordAmount === sel.id) {
+    return `<div class="p-2.5 bg-teal-50 rounded-xl">
+      <p class="text-xs font-bold text-teal-700 mb-1.5">Edit amount (₹)</p>
+      <div class="flex gap-2">
+        <input id="record-amount-input" type="number" value="${sel.amount!=null?sel.amount:''}" placeholder="e.g. 1250" class="flex-1 px-3 py-2 border border-stone-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/>
+        <button data-action="save-record-amount" data-id="${sel.id}" class="px-3 py-2 rounded-lg text-xs font-bold text-white" style="background:${C.teal}">Save</button>
+        <button data-action="cancel-record-amount" class="px-3 py-2 rounded-lg text-xs font-bold border border-stone-200 text-stone-500">Cancel</button>
+      </div>
+    </div>`;
+  }
+  return `<div class="flex items-center justify-between"><div><p class="text-xs text-stone-400">Amount</p><p class="font-semibold text-stone-800">${sel.amount!=null?fmtINR(sel.amount):'—'}</p></div><button data-action="edit-record-amount" data-id="${sel.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400" title="Edit amount">${iconHtml('pencil',13)}</button></div>`;
+}
+
 // A lightweight record-detail modal (used from episode view where there's no side panel)
 function renderRecordDetailModal(sel) {
   const ts = typeStyle(sel.type);
@@ -1340,7 +1428,7 @@ function renderRecordDetailModal(sel) {
       ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
 
       <div class="space-y-2.5 text-sm">
-        ${dateEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'Amount',v:sel.amount?fmtINR(sel.amount):null},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+        ${dateEditRowHtml(sel)}${amountEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
       </div>
       ${sel.summary?`<div class="mt-3 p-3 bg-teal-50 rounded-xl"><p class="text-xs font-bold text-teal-700 mb-0.5">Summary</p><p class="text-sm text-teal-800">${esc(sel.summary)}</p></div>`:''}
       ${ex.diagnosis?`<div class="mt-3"><p class="text-xs text-stone-400">Diagnosis</p><p class="text-sm text-stone-800">${esc(ex.diagnosis)}</p></div>`:''}
@@ -2005,6 +2093,167 @@ function renderFollowupEditor() {
   </div>`;
 }
 
+// ═════════════════════════════════════════
+//  LAYER 4 — TRENDS (same lab value over time)
+// ═════════════════════════════════════════
+// Canonical names so the same test lines up across labs (SGPT=ALT, etc.)
+const LAB_ALIASES = {
+  'sgpt':'ALT (SGPT)', 'alt':'ALT (SGPT)', 'alanine transaminase':'ALT (SGPT)', 'alanine aminotransferase':'ALT (SGPT)',
+  'sgot':'AST (SGOT)', 'ast':'AST (SGOT)', 'aspartate transaminase':'AST (SGOT)', 'aspartate aminotransferase':'AST (SGOT)',
+  'ggt':'GGT', 'gamma gt':'GGT', 'gamma glutamyl transferase':'GGT', 'ggtp':'GGT',
+  'total bilirubin':'Total Bilirubin', 'bilirubin total':'Total Bilirubin', 'bilirubin':'Total Bilirubin', 'serum bilirubin':'Total Bilirubin',
+  'direct bilirubin':'Direct Bilirubin', 'bilirubin direct':'Direct Bilirubin',
+  'alkaline phosphatase':'ALP', 'alp':'ALP',
+  'creatinine':'Creatinine', 'sr creatinine':'Creatinine', 'sr. creatinine':'Creatinine', 'serum creatinine':'Creatinine',
+  'urea':'Urea', 'blood urea':'Urea', 'bun':'Urea',
+  'uric acid':'Uric Acid', 'sr uric acid':'Uric Acid',
+  'hba1c':'HbA1c', 'glycated haemoglobin':'HbA1c', 'glycosylated hemoglobin':'HbA1c', 'hb a1c':'HbA1c',
+  'fasting blood sugar':'Fasting Glucose', 'fbs':'Fasting Glucose', 'glucose fasting':'Fasting Glucose', 'fasting glucose':'Fasting Glucose', 'blood sugar fasting':'Fasting Glucose',
+  'post prandial blood sugar':'PP Glucose', 'ppbs':'PP Glucose', 'glucose pp':'PP Glucose',
+  'total cholesterol':'Total Cholesterol', 'cholesterol total':'Total Cholesterol', 'cholesterol':'Total Cholesterol',
+  'hdl':'HDL', 'hdl cholesterol':'HDL', 'ldl':'LDL', 'ldl cholesterol':'LDL',
+  'triglycerides':'Triglycerides', 'tg':'Triglycerides',
+  'tsh':'TSH', 't3':'T3', 't4':'T4', 'free t4':'Free T4', 'free t3':'Free T3',
+  'hemoglobin':'Hemoglobin', 'haemoglobin':'Hemoglobin', 'hb':'Hemoglobin',
+  'platelet count':'Platelets', 'platelets':'Platelets', 'platelet':'Platelets',
+  'wbc':'WBC', 'total wbc count':'WBC', 'tlc':'WBC',
+  'vitamin d':'Vitamin D', '25-oh vitamin d':'Vitamin D', 'vitamin d3':'Vitamin D', '25 hydroxy vitamin d':'Vitamin D',
+  'vitamin b12':'Vitamin B12', 'b12':'Vitamin B12',
+  'esr':'ESR', 'crp':'CRP',
+  'pt inr':'INR', 'inr':'INR', 'prothrombin time':'PT',
+};
+function canonicalTest(name) {
+  if (!name) return null;
+  const key = name.toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim();
+  if (LAB_ALIASES[key]) return LAB_ALIASES[key];
+  // title-case the raw name as its own canonical bucket
+  return name.replace(/\s+/g,' ').trim().replace(/\b\w/g, c => c.toUpperCase());
+}
+function parseNum(v) {
+  if (v == null) return null;
+  const m = String(v).replace(/,/g,'').match(/-?\d+(\.\d+)?/);
+  return m ? parseFloat(m[0]) : null;
+}
+function parseUnit(v) {
+  if (v == null) return '';
+  const m = String(v).match(/[a-zA-Z%\/µ]+.*/);
+  return m ? m[0].trim() : '';
+}
+function parseRange(normal) {
+  if (!normal) return { low: null, high: null };
+  const s = String(normal).replace(/,/g,'');
+  let m = s.match(/(-?\d+(?:\.\d+)?)\s*[-–to]+\s*(-?\d+(?:\.\d+)?)/i);
+  if (m) return { low: parseFloat(m[1]), high: parseFloat(m[2]) };
+  m = s.match(/[<≤]\s*(-?\d+(?:\.\d+)?)/); if (m) return { low: null, high: parseFloat(m[1]) };
+  m = s.match(/[>≥]\s*(-?\d+(?:\.\d+)?)/); if (m) return { low: parseFloat(m[1]), high: null };
+  return { low: null, high: null };
+}
+
+// Build trends for a member from all their records' extracted keyValues
+function computeTrends(memberId) {
+  const recs = state.allRecords.filter(r => r.mid === memberId && r.date && r.extracted?.keyValues?.length);
+  const buckets = {};
+  recs.forEach(r => {
+    r.extracted.keyValues.forEach(kv => {
+      const num = parseNum(kv.value);
+      if (num == null) return;
+      const canon = canonicalTest(kv.name);
+      if (!canon) return;
+      (buckets[canon] = buckets[canon] || []).push({
+        date: r.date, value: num, unit: parseUnit(kv.value), status: kv.status,
+        range: parseRange(kv.normal), recordId: r.id,
+      });
+    });
+  });
+  const trends = [];
+  Object.keys(buckets).forEach(canon => {
+    const pts = buckets[canon].sort((a,b) => new Date(a.date) - new Date(b.date));
+    if (pts.length < 2) return; // need at least 2 readings to trend
+    const latest = pts[pts.length-1], prev = pts[pts.length-2];
+    const range = pts.map(p => p.range).find(r => r.low != null || r.high != null) || { low:null, high:null };
+    let dir = 'flat';
+    if (latest.value > prev.value) dir = 'up';
+    else if (latest.value < prev.value) dir = 'down';
+    const outOfRange = (range.high != null && latest.value > range.high) || (range.low != null && latest.value < range.low);
+    trends.push({ canon, pts, unit: latest.unit, latest, prev, range, dir, outOfRange });
+  });
+  // out-of-range first, then most readings
+  trends.sort((a,b) => (b.outOfRange?1:0)-(a.outOfRange?1:0) || b.pts.length - a.pts.length);
+  return trends;
+}
+
+function renderTrends() {
+  const m = currentMember();
+  const trends = computeTrends(state.currentId);
+  const body = trends.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('trending-up',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No trends yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Upload at least two reports containing the same test (e.g. two LFTs) and ${esc(m.name.split(' ')[0])}'s values will chart here over time.</p></div>`
+    : `<div class="space-y-3">${trends.map((t, i) => {
+        const chg = t.latest.value - t.prev.value;
+        const dirColor = t.outOfRange ? 'text-rose-600' : (t.dir==='flat'?'text-stone-400':'text-teal-600');
+        const dirIcon = t.dir==='up'?'trending-up':t.dir==='down'?'trending-down':'minus';
+        const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`<${t.range.high}`:t.range.low!=null?`>${t.range.low}`:'';
+        return `<div class="bg-white rounded-2xl p-4 border ${t.outOfRange?'border-rose-200':'border-stone-100'} shadow-sm">
+          <div class="flex items-start justify-between mb-2">
+            <div>
+              <p class="font-bold text-stone-900 text-sm">${esc(t.canon)}</p>
+              <div class="flex items-baseline gap-2 mt-0.5">
+                <span class="text-2xl font-black ${t.outOfRange?'text-rose-600':'text-stone-900'}">${t.latest.value}</span>
+                <span class="text-xs text-stone-400">${esc(t.unit||'')}</span>
+                <span class="text-xs font-bold ${dirColor} flex items-center gap-0.5">${iconHtml(dirIcon,12)}${chg>0?'+':''}${(Math.round(chg*100)/100)}</span>
+              </div>
+            </div>
+            <div class="text-right">
+              ${t.outOfRange?badgeHtml('Out of range','bg-rose-50 text-rose-600'):badgeHtml('In range','bg-emerald-50 text-emerald-600')}
+              ${rangeTxt?`<p class="text-xs text-stone-400 mt-1">ref: ${rangeTxt}</p>`:''}
+            </div>
+          </div>
+          <canvas id="trend-chart-${i}" height="90"></canvas>
+          <p class="text-xs text-stone-400 mt-2">${t.pts.length} readings · ${fmtDate(t.pts[0].date)} → ${fmtDate(t.latest.date)}</p>
+          ${t.outOfRange?`<div class="mt-2 p-2 bg-amber-50 rounded-lg flex items-start gap-2">${iconHtml('info',13,'text-amber-500 flex-shrink-0 mt-0.5')}<p class="text-xs text-amber-700">Latest reading is outside the reference range — worth asking ${esc(m.name.split(' ')[0])}'s doctor about.</p></div>`:''}
+        </div>`;
+      }).join('')}</div>`;
+
+  return `<div class="fade-in max-w-2xl">
+    <h1 class="text-xl md:text-2xl font-bold text-stone-900">Trends</h1>
+    <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · how lab values move over time</p>
+    ${body}
+  </div>`;
+}
+
+function mountTrendsCharts() {
+  const trends = computeTrends(state.currentId);
+  trends.forEach((t, i) => {
+    const el = document.getElementById(`trend-chart-${i}`);
+    if (!el) return;
+    destroyChart(`trend-chart-${i}`);
+    const labels = t.pts.map(p => new Date(p.date).toLocaleDateString('en-IN',{month:'short',year:'2-digit'}));
+    const data = t.pts.map(p => p.value);
+    const annotations = [];
+    chartRegistry[`trend-chart-${i}`] = new Chart(el.getContext('2d'), {
+      type: 'line',
+      data: { labels, datasets: [{
+        data, borderColor: t.outOfRange ? '#e11d48' : C.teal, backgroundColor: (t.outOfRange?'#e11d48':C.teal)+'22',
+        borderWidth: 2, tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: t.pts.map(p => {
+          const oor = (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
+          return oor ? '#e11d48' : (t.outOfRange?'#e11d48':C.teal);
+        }),
+      }]},
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false }, tooltip: { enabled: true } },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 9 }, color: '#a8a29e' } },
+          y: {
+            grid: { color: '#f5f5f4' }, ticks: { font: { size: 9 }, color: '#a8a29e' },
+            suggestedMin: t.range.low != null ? Math.min(t.range.low, ...data) : undefined,
+            suggestedMax: t.range.high != null ? Math.max(t.range.high, ...data) : undefined,
+          },
+        },
+      },
+    });
+  });
+}
+
 // ── Settings page ──
 function renderSettings() {
   const email = state.session?.user?.email || '';
@@ -2055,6 +2304,7 @@ const NAV = [
   { id:'dashboard', label:'Dashboard', icon:'home' },
   { id:'records', label:'Medical Records', icon:'file-text' },
   { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
+  { id:'trends', label:'Trends', icon:'trending-up' },
   { id:'healthplan', label:'Health Plan', icon:'target' },
   { id:'dailylog', label:'Daily Log', icon:'book-open' },
   { id:'spending', label:'Spending', icon:'dollar-sign' },
@@ -2070,6 +2320,7 @@ const MOBILE_MAIN = [
   { id:'aidoctor', label:'AI Doctor', icon:'brain' },
 ];
 const MOBILE_MORE = [
+  { id:'trends', label:'Trends', icon:'trending-up', desc:'Lab values over time' },
   { id:'dailylog', label:'Daily Log', icon:'pencil', desc:'Log today' },
   { id:'healthplan', label:'Health Plan', icon:'target', desc:'Diet, meds, tests' },
   { id:'spending', label:'Spending', icon:'dollar-sign', desc:'Bills, savings' },
@@ -2158,7 +2409,7 @@ function renderHeader() {
 
 function renderPageContent() {
   // Per-person pages need a selected member. In Whole-Family view, prompt to pick one (Option A).
-  const perPersonPages = ['dashboard', 'healthplan', 'dailylog', 'metrics'];
+  const perPersonPages = ['dashboard', 'healthplan', 'dailylog', 'metrics', 'trends'];
   if (state.familyView && perPersonPages.includes(state.page)) {
     return renderPickPerson();
   }
@@ -2166,6 +2417,7 @@ function renderPageContent() {
     case 'dashboard': return renderDashboard();
     case 'records': return renderRecords();
     case 'upcoming': return renderUpcoming();
+    case 'trends': return renderTrends();
     case 'healthplan': return renderHealthPlan();
     case 'dailylog': return renderDailyLog();
     case 'spending': return renderSpending();
@@ -2243,6 +2495,7 @@ function mountChartsForCurrentPage() {
   if (state.page === 'dashboard') mountDashboardCharts();
   if (state.page === 'spending') mountSpendingCharts();
   if (state.page === 'metrics') mountMetricsChart();
+  if (state.page === 'trends') mountTrendsCharts();
 }
 
 // ─────────────────────────────────────────
@@ -2374,9 +2627,24 @@ document.addEventListener('click', async (e) => {
       closeUploadModal();
       break;
     case 'retry-upload':
-      setState({ uploadModal: { phase: 'select', file: null, ext: null, pct: 0, progressMsg: '', errMsg: '', mismatchName: '', uploading: false } });
-      setTimeout(wireUploadModalInputs, 30);
+      if (state.uploadModal?.file) {
+        // Re-run AI on the same file
+        setState({ uploadModal: { ...state.uploadModal, phase: 'analysing', pct: 5, progressMsg: 'Reading your file…' } });
+        runUploadAnalysis(state.uploadModal.file);
+      } else {
+        setState({ uploadModal: { phase: 'select', file: null, ext: null, pct: 0, progressMsg: '', errMsg: '', mismatchName: '', uploading: false } });
+        setTimeout(wireUploadModalInputs, 30);
+      }
       break;
+    case 'upload-manual': {
+      // Switch to manual entry, prefilling anything the AI managed to read; keep any selected file
+      const um = state.uploadModal || {};
+      const ext = um.ext || {};
+      const manual = { title: ext.title || '', type: ext.docType || 'report', date: ext.date || new Date().toISOString().slice(0,10), amount: ext.amount || '', doctor: ext.doctor || '', hospital: ext.hospital || '', summary: ext.summary || '' };
+      const target = state.uploadTargetId || state.lastUploadMemberId || state.currentId;
+      setState({ uploadModal: { ...um, phase: 'manual', manual, uploading: false }, uploadTargetId: target });
+      break;
+    }
     case 'save-upload':
       saveUploadRecord(el.dataset.memberId);
       break;
@@ -2451,6 +2719,15 @@ document.addEventListener('click', async (e) => {
     case 'save-record-date':
       await handleSaveRecordDate(el.dataset.id);
       break;
+    case 'edit-record-amount':
+      setState({ editingRecordAmount: el.dataset.id });
+      break;
+    case 'cancel-record-amount':
+      setState({ editingRecordAmount: null });
+      break;
+    case 'save-record-amount':
+      await handleSaveRecordAmount(el.dataset.id);
+      break;
     case 'do-move-patient':
       await handleMovePatient(el.dataset.record, el.dataset.member);
       break;
@@ -2506,6 +2783,7 @@ document.addEventListener('click', async (e) => {
   if (e.target.id === 'am-save') handleAddMemberSave();
   if (e.target.id === 'me-save') handleSaveMember();
   if (e.target.id === 'fu-save') handleSaveFollowup();
+  if (e.target.id === 'man-save') handleSaveManual();
   if (e.target.id === 'dl-save') handleSaveDailyLog();
   if (e.target.id === 'metric-save') handleSaveMetric();
   if (e.target.id === 'ep-save') handleSaveEpisode();
@@ -2643,6 +2921,18 @@ async function handleSaveRecordDate(recordId) {
     setState({ editingRecordDate: null, records: state.records.map(patch) });
     showToast('Date updated ✓');
   } catch (e) { showToast('Could not update date — try again'); }
+}
+
+async function handleSaveRecordAmount(recordId) {
+  const raw = document.getElementById('record-amount-input')?.value;
+  const amount = raw === '' || raw == null ? null : parseFloat(raw);
+  try {
+    await db.updateRecordFields(recordId, { amount });
+    await loadFamilyData();
+    const patch = r => r.id === recordId ? { ...r, amount } : r;
+    setState({ editingRecordAmount: null, records: state.records.map(patch) });
+    showToast('Amount updated ✓');
+  } catch (e) { showToast('Could not update amount — try again'); }
 }
 
 // Silently remove empty (0-document) threads. Runs automatically when you ENTER the thread view,

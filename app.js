@@ -975,7 +975,16 @@ function renderUploadModal() {
     const fld = (id, label, ph='', type='text') => `<div><label class="block text-xs font-bold text-stone-500 mb-1">${label}</label><input id="man-${id}" type="${type}" value="${d[id]!=null?esc(String(d[id])):''}" placeholder="${ph}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>`;
     body = `
       <div class="space-y-3">
-        ${um.file?`<div class="flex items-center gap-2 px-3 py-2 bg-stone-50 rounded-xl text-xs text-stone-500">${iconHtml('file-text',13)}<span class="truncate flex-1">${esc(um.file.name)}</span><span>will be stored</span></div>`:`<div class="flex items-center gap-2 px-3 py-2 bg-stone-50 rounded-xl text-xs text-stone-400">${iconHtml('info',13)} No file attached — saving details only</div>`}
+        <input type="file" id="man-file-input" accept="image/*,.pdf,.heic,.heif" class="hidden"/>
+        <input type="file" id="man-camera-input" accept="image/*" capture="environment" class="hidden"/>
+        ${um.file
+          ? `<div class="flex items-center gap-2 px-3 py-2.5 bg-teal-50 border border-teal-100 rounded-xl text-xs">${iconHtml('file-text',14,'text-teal-600')}<span class="truncate flex-1 font-semibold text-teal-800">${esc(um.file.name)}</span><span class="text-teal-600">${(um.file.size/1024).toFixed(0)} KB</span><button data-action="manual-remove-file" class="ml-1 text-stone-400 hover:text-rose-500">${iconHtml('x',14)}</button></div>`
+          : `<div class="flex gap-2">
+              <button id="man-file-btn" type="button" class="flex-1 flex items-center justify-center gap-2 py-2.5 border border-dashed border-stone-300 rounded-xl text-xs font-bold text-stone-500 hover:border-teal-400 hover:bg-teal-50">${iconHtml('paperclip',14)} Attach document</button>
+              <button id="man-camera-btn" type="button" class="flex items-center justify-center gap-2 px-3 py-2.5 border border-dashed border-stone-300 rounded-xl text-xs font-bold text-stone-500 hover:border-teal-400 hover:bg-teal-50">${iconHtml('camera',14)}</button>
+            </div>
+            <p class="text-xs text-stone-400 -mt-1">Optional — the document is stored, but AI won't read it. You'll type the details below.</p>`
+        }
         <div>
           <label class="block text-xs font-bold text-stone-500 mb-1">Who is this for? *</label>
           <div class="flex gap-2 overflow-x-auto pb-1 hide-scrollbar">
@@ -2338,29 +2347,25 @@ function renderSettings() {
 //  NAVIGATION
 // ─────────────────────────────────────────
 const NAV = [
-  { id:'dashboard', label:'Dashboard', icon:'home' },
   { id:'records', label:'Medical Records', icon:'file-text' },
   { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
   { id:'trends', label:'Trends', icon:'trending-up' },
-  { id:'healthplan', label:'Health Plan', icon:'target' },
-  { id:'dailylog', label:'Daily Log', icon:'book-open' },
   { id:'spending', label:'Spending', icon:'dollar-sign' },
   { id:'aidoctor', label:'AI Doctor', icon:'brain', badge:'AI' },
+  { id:'healthplan', label:'Health Plan', icon:'target' },
   { id:'metrics', label:'Metrics', icon:'activity' },
   { id:'family', label:'Family', icon:'user' },
   { id:'settings', label:'Settings', icon:'settings' },
 ];
 const MOBILE_MAIN = [
-  { id:'dashboard', label:'Home', icon:'home' },
   { id:'records', label:'Records', icon:'file-text' },
   { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
-  { id:'aidoctor', label:'AI Doctor', icon:'brain' },
+  { id:'trends', label:'Trends', icon:'trending-up' },
+  { id:'spending', label:'Spending', icon:'dollar-sign' },
 ];
 const MOBILE_MORE = [
-  { id:'trends', label:'Trends', icon:'trending-up', desc:'Lab values over time' },
-  { id:'dailylog', label:'Daily Log', icon:'pencil', desc:'Log today' },
+  { id:'aidoctor', label:'AI Doctor', icon:'brain', desc:'Ask about your records' },
   { id:'healthplan', label:'Health Plan', icon:'target', desc:'Diet, meds, tests' },
-  { id:'spending', label:'Spending', icon:'dollar-sign', desc:'Bills, savings' },
   { id:'metrics', label:'Metrics', icon:'activity', desc:'BP, weight, steps' },
   { id:'family', label:'Family', icon:'user', desc:'All members' },
   { id:'settings', label:'Settings', icon:'settings', desc:'Account, AI usage' },
@@ -2386,9 +2391,10 @@ function renderSidebar() {
 }
 
 function renderBottomNav() {
+  const onMore = MOBILE_MORE.some(n => n.id === state.page);
   return `<nav class="fixed bottom-0 left-0 right-0 z-30 bg-white border-t border-stone-100 flex md:hidden">
     ${MOBILE_MAIN.map(n => `<button data-action="goto" data-page="${n.id}" class="flex-1 flex flex-col items-center gap-0.5 py-2.5" style="color:${state.page===n.id?C.teal:'#94a3b8'}">${iconHtml(n.icon,20)}<span class="text-xs font-bold">${n.label}</span></button>`).join('')}
-    <button data-action="open-more" class="flex-1 flex flex-col items-center gap-0.5 py-2.5 text-stone-400">${iconHtml('more-horizontal',20)}<span class="text-xs font-bold">More</span></button>
+    <button data-action="open-more" class="flex-1 flex flex-col items-center gap-0.5 py-2.5" style="color:${onMore?C.teal:'#94a3b8'}">${iconHtml('more-horizontal',20)}<span class="text-xs font-bold">More</span></button>
   </nav>`;
 }
 
@@ -2462,7 +2468,7 @@ function renderPageContent() {
     case 'metrics': return renderMetrics();
     case 'family': return renderFamily();
     case 'settings': return renderSettings();
-    default: return renderDashboard();
+    default: return renderRecords();
   }
 }
 
@@ -2525,6 +2531,9 @@ function render() {
   }
   if (window.lucide) lucide.createIcons();
   mountChartsForCurrentPage();
+  // Keep upload file inputs wired across re-renders (select + manual phases)
+  const ph = state.uploadModal?.phase;
+  if (ph === 'select' || ph === 'manual') wireUploadModalInputs();
 }
 
 function mountChartsForCurrentPage() {
@@ -2680,13 +2689,26 @@ document.addEventListener('click', async (e) => {
       const manual = { title: ext.title || '', type: ext.docType || 'report', date: ext.date || new Date().toISOString().slice(0,10), amount: ext.amount || '', doctor: ext.doctor || '', hospital: ext.hospital || '', summary: ext.summary || '' };
       const target = state.uploadTargetId || state.lastUploadMemberId || state.currentId;
       setState({ uploadModal: { ...um, phase: 'manual', manual, uploading: false }, uploadTargetId: target });
+      setTimeout(wireUploadModalInputs, 30);
+      break;
+    }
+    case 'manual-remove-file': {
+      const cur = captureManualFields();
+      setState({ uploadModal: { ...state.uploadModal, file: null, manual: { ...state.uploadModal.manual, ...cur } } });
+      setTimeout(wireUploadModalInputs, 30);
       break;
     }
     case 'save-upload':
       saveUploadRecord(el.dataset.memberId);
       break;
     case 'set-upload-target':
-      setState({ uploadTargetId: el.dataset.id });
+      // In manual phase, capture typed fields first so tapping a member chip doesn't wipe them
+      if (state.uploadModal?.phase === 'manual') {
+        const cur = captureManualFields();
+        setState({ uploadTargetId: el.dataset.id, uploadModal: { ...state.uploadModal, manual: { ...state.uploadModal.manual, ...cur } } });
+      } else {
+        setState({ uploadTargetId: el.dataset.id });
+      }
       break;
     case 'upload-add-member': {
       // open member editor prefilled with the AI-detected name; on save it becomes the upload target
@@ -2887,6 +2909,27 @@ function wireUploadModalInputs() {
   if (fileInput) fileInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) runUploadAnalysis(f); };
   if (camBtn && camInput) camBtn.onclick = () => camInput.click();
   if (camInput) camInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) runUploadAnalysis(f); };
+  // Manual-phase attach (stores the file WITHOUT triggering AI)
+  const manFile = document.getElementById('man-file-input');
+  const manCam = document.getElementById('man-camera-input');
+  const manFileBtn = document.getElementById('man-file-btn');
+  const manCamBtn = document.getElementById('man-camera-btn');
+  if (manFileBtn && manFile) manFileBtn.onclick = () => manFile.click();
+  if (manFile) manFile.onchange = (e) => { const f = e.target.files?.[0]; if (f) attachManualFile(f); };
+  if (manCamBtn && manCam) manCamBtn.onclick = () => manCam.click();
+  if (manCam) manCam.onchange = (e) => { const f = e.target.files?.[0]; if (f) attachManualFile(f); };
+}
+
+// Attach (or replace) a file in the manual entry form. Preserves whatever fields are already typed.
+function attachManualFile(f) {
+  const cur = captureManualFields();
+  setState({ uploadModal: { ...state.uploadModal, file: f, manual: { ...state.uploadModal.manual, ...cur } } });
+  setTimeout(wireUploadModalInputs, 30);
+}
+// Read the manual form fields from the DOM so they survive a re-render
+function captureManualFields() {
+  const g = k => document.getElementById('man-' + k)?.value;
+  return { title: g('title'), type: g('type'), date: g('date'), amount: g('amount'), doctor: g('doctor'), hospital: g('hospital'), summary: g('summary') };
 }
 
 // ─────────────────────────────────────────

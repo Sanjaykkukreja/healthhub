@@ -69,6 +69,7 @@ let state = {
   compareModal: null,         // { canon } — trend comparison modal
   compareA: null, compareB: null,  // selected reading dates
   compareInsight: null, compareLoading: false,
+  compareRepA: null, compareRepB: null,  // selected report ids for report-vs-report compare
   trendTest: null,            // selected test canon for the inline compare panel
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
@@ -459,7 +460,7 @@ Respond with ONLY valid JSON (no markdown fences):
   "diagnosis": "primary diagnosis/impression or null",
   "threadTopic": "a short 1-3 word condition/topic folder name, person-agnostic and reusable across the family (e.g. 'Liver', 'Diabetes', 'Knee Replacement', 'Thyroid', 'Cardiac'). Prefer a broad ongoing topic over a one-time event. null if truly a one-off.",
   "medications": [{"name":"","dose":"","freq":"","duration":"","purpose":""}],
-  "keyValues": [{"name":"","value":"","status":"normal|high|low|critical|borderline","normal":""}],
+  "keyValues": [{"name":"","std":"standardized short test name so the same test matches across labs — use exactly one of: ALT, AST, GGT, ALP, Total Bilirubin, Direct Bilirubin, Creatinine, Urea, Uric Acid, HbA1c, Fasting Glucose, PP Glucose, Total Cholesterol, HDL, LDL, Triglycerides, TSH, T3, T4, Free T3, Free T4, Hemoglobin, Platelets, WBC, Vitamin D, Vitamin B12, ESR, CRP, INR — if none fit, repeat the test name as-is","value":"","status":"normal|high|low|critical|borderline","normal":""}],
   "advice": "lifestyle/diet instructions or null",
   "followup": "next visit/test instructions or null",
   "followUpDate": "YYYY-MM-DD if the document states or clearly implies a specific next date/deadline, else null",
@@ -2260,9 +2261,15 @@ const LAB_ALIASES = {
 };
 function canonicalTest(name) {
   if (!name) return null;
-  const key = name.toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim();
+  const key = name.toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
   if (LAB_ALIASES[key]) return LAB_ALIASES[key];
-  // title-case the raw name as its own canonical bucket
+  // Match a known alias as a whole word — longest aliases first so 'total cholesterol'
+  // beats 'cholesterol' and 'hba1c' beats 'hb'. Handles 'AST (SGOT)', 'SGOT (AST)', etc.
+  const aliasKeys = Object.keys(LAB_ALIASES).sort((a,b) => b.length - a.length);
+  for (const ak of aliasKeys) {
+    const re = new RegExp('\\b' + ak.replace(/[.*+?^${}()|[\]\\]/g,'\\$&') + '\\b');
+    if (re.test(key)) return LAB_ALIASES[ak];
+  }
   return name.replace(/\s+/g,' ').trim().replace(/\b\w/g, c => c.toUpperCase());
 }
 function parseNum(v) {
@@ -2293,7 +2300,7 @@ function computeTrends(memberId) {
     r.extracted.keyValues.forEach(kv => {
       const num = parseNum(kv.value);
       if (num == null) return;
-      const canon = canonicalTest(kv.name);
+      const canon = canonicalTest(kv.std || kv.name);
       if (!canon) return;
       (buckets[canon] = buckets[canon] || []).push({
         date: r.date, value: num, unit: parseUnit(kv.value), status: kv.status,
@@ -2324,7 +2331,7 @@ function computeAllTests(memberId) {
   recs.forEach(r => {
     r.extracted.keyValues.forEach(kv => {
       const num = parseNum(kv.value); if (num == null) return;
-      const canon = canonicalTest(kv.name); if (!canon) return;
+      const canon = canonicalTest(kv.std || kv.name); if (!canon) return;
       (buckets[canon] = buckets[canon] || []).push({ date: r.date, value: num, unit: parseUnit(kv.value), status: kv.status, range: parseRange(kv.normal) });
     });
   });
@@ -2340,10 +2347,25 @@ function computeAllTests(memberId) {
   return out;
 }
 
+// Reports (records with lab values) for a member, newest first — used for report-vs-report compare
+function reportsWithLabs(memberId) {
+  return state.allRecords
+    .filter(r => r.mid === memberId && r.date && r.extracted?.keyValues?.some(kv => parseNum(kv.value) != null))
+    .map(r => {
+      const vals = {};
+      r.extracted.keyValues.forEach(kv => {
+        const num = parseNum(kv.value); if (num == null) return;
+        const canon = canonicalTest(kv.std || kv.name); if (!canon) return;
+        vals[canon] = { value: num, unit: parseUnit(kv.value), range: parseRange(kv.normal) };
+      });
+      return { id: r.id, date: r.date, title: r.title, vals };
+    })
+    .sort((a,b) => new Date(b.date) - new Date(a.date));
+}
+
 function renderTrends() {
   const m = currentMember();
   const all = computeAllTests(state.currentId);
-  const comparable = all.filter(t => t.pts.length >= 2);
 
   if (all.length === 0) {
     return `<div class="fade-in max-w-2xl">
@@ -2371,38 +2393,45 @@ function renderTrends() {
     </table>
   </div>`;
 
-  // 2) Guided compare panel: test → date1 → date2 → AI
+  // 2) Report-vs-report comparison: pick two reports, see all parameters side by side + whole-report AI
+  const reports = reportsWithLabs(state.currentId);
   let compareHtml = '';
-  if (comparable.length === 0) {
-    compareHtml = `<div class="bg-stone-50 rounded-2xl p-4 text-center text-xs text-stone-400">Upload a second reading of any test to compare readings over time.</div>`;
+  if (reports.length < 2) {
+    compareHtml = `<div class="bg-stone-50 rounded-2xl p-4 text-center text-xs text-stone-400">Upload a second lab report to compare two reports side by side.</div>`;
   } else {
-    const selCanon = state.trendTest && comparable.some(t=>t.canon===state.trendTest) ? state.trendTest : comparable[0].canon;
-    const t = comparable.find(x => x.canon === selCanon);
-    const pts = t.pts;
-    const aDate = state.compareA && pts.some(p=>p.date===state.compareA) ? state.compareA : pts[0].date;
-    const bDate = state.compareB && pts.some(p=>p.date===state.compareB) ? state.compareB : pts[pts.length-1].date;
-    const A = pts.find(p => p.date === aDate), B = pts.find(p => p.date === bDate);
-    const oor = (p) => (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
-    const delta = Math.round((B.value - A.value) * 100) / 100;
-    const pct = A.value ? Math.round((B.value - A.value) / A.value * 100) : null;
-    const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`< ${t.range.high}`:t.range.low!=null?`> ${t.range.low}`:'not specified';
-    const col = (p, label, showDelta) => `<div class="flex-1 p-3 rounded-xl ${oor(p)?'bg-rose-50 border border-rose-100':'bg-white border border-stone-100'}">
-      <p class="text-xs font-bold text-stone-400 uppercase tracking-wide">${label}</p>
-      <p class="text-xs text-stone-400 mt-0.5">${fmtDate(p.date)}</p>
-      <p class="text-2xl font-black mt-1 ${oor(p)?'text-rose-600':'text-stone-900'}">${p.value}<span class="text-xs font-bold text-stone-400 ml-1">${esc(p.unit||t.unit||'')}</span></p>
-      ${showDelta&&delta!==0?`<p class="text-xs font-black mt-1 ${delta>0?'text-rose-500':'text-teal-600'}">${delta>0?'▲ +':'▼ '}${delta}${pct!=null?` (${pct>0?'+':''}${pct}%)`:''}</p>`:''}
-    </div>`;
-    const dateChips = (which, sel) => pts.map(p => `<button data-action="set-compare-${which}" data-date="${p.date}" class="px-2.5 py-1 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${sel===p.date?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${sel===p.date?`background:${C.teal}`:''}">${fmtDate(p.date)}</button>`).join('');
+    const bId = state.compareRepB && reports.some(r=>r.id===state.compareRepB) ? state.compareRepB : reports[0].id;
+    const aId = state.compareRepA && reports.some(r=>r.id===state.compareRepA) ? state.compareRepA : reports[1].id;
+    const RA = reports.find(r => r.id === aId), RB = reports.find(r => r.id === bId);
+    // union of parameters across both reports
+    const params = [...new Set([...Object.keys(RA.vals), ...Object.keys(RB.vals)])];
+    const reportChip = (r, which, selId) => `<button data-action="set-report-${which}" data-id="${r.id}" class="px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${selId===r.id?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${selId===r.id?`background:${C.teal}`:''}">${fmtDate(r.date)}</button>`;
+    const rowsHtml = params.map(p => {
+      const a = RA.vals[p], b = RB.vals[p];
+      const range = (a&&(a.range.low!=null||a.range.high!=null))?a.range:(b?b.range:{low:null,high:null});
+      const oor = v => v!=null && ((range.high!=null&&v>range.high)||(range.low!=null&&v<range.low));
+      const delta = (a&&b)?Math.round((b.value-a.value)*100)/100:null;
+      const rangeTxt = range.low!=null&&range.high!=null?`${range.low}–${range.high}`:range.high!=null?`< ${range.high}`:range.low!=null?`> ${range.low}`:'';
+      return `<tr class="border-b border-stone-50 last:border-0">
+        <td class="px-3 py-2 font-semibold text-stone-700 text-xs">${esc(p)}${rangeTxt?`<span class="block text-stone-400 font-normal">${rangeTxt}</span>`:''}</td>
+        <td class="px-2 py-2 text-right font-bold ${oor(a?.value)?'text-rose-600':'text-stone-800'}">${a?a.value:'—'}</td>
+        <td class="px-2 py-2 text-right font-bold ${oor(b?.value)?'text-rose-600':'text-stone-800'}">${b?b.value:'—'}</td>
+        <td class="px-3 py-2 text-right text-xs font-semibold ${delta==null?'text-stone-300':delta>0?'text-rose-400':delta<0?'text-teal-500':'text-stone-300'}">${delta==null?'—':(delta>0?'▲+':delta<0?'▼':'')+(delta!==0?delta:'0')}</td>
+      </tr>`;
+    }).join('');
 
     compareHtml = `<div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
-      <p class="text-sm font-bold text-stone-800 mb-3">Compare two readings</p>
-      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Test</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${comparable.map(x=>`<button data-action="trend-set-test" data-canon="${esc(x.canon)}" class="px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${selCanon===x.canon?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${selCanon===x.canon?`background:${C.teal}`:''}">${esc(x.canon)}</button>`).join('')}</div></div>
-      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Earlier date</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${dateChips('a', aDate)}</div></div>
-      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Later date</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${dateChips('b', bDate)}</div></div>
-      <div class="flex items-stretch gap-2 mb-2">${col(A,'Earlier',false)}<div class="flex items-center">${iconHtml('arrow-right',16,'text-stone-300')}</div>${col(B,'Later',true)}</div>
-      <p class="text-xs text-stone-400 mb-3">Reference range: ${rangeTxt} ${esc(t.unit||'')}</p>
-      ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-xl mb-3"><div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI interpretation</p></div><p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p><p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p></div>`:''}
-      <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-2.5 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Thinking…':(state.compareInsight?'Re-interpret':'Ask AI to interpret this change')}</button>
+      <p class="text-sm font-bold text-stone-800 mb-1">Compare two reports</p>
+      <p class="text-xs text-stone-400 mb-3">Pick two dates — all shared values line up side by side.</p>
+      <div class="mb-2"><p class="text-xs font-bold text-stone-400 mb-1.5">Earlier report</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${reports.map(r=>reportChip(r,'a',aId)).join('')}</div></div>
+      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Later report</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${reports.map(r=>reportChip(r,'b',bId)).join('')}</div></div>
+      <div class="rounded-xl border border-stone-100 overflow-hidden mb-3">
+        <table class="w-full text-sm">
+          <thead><tr class="text-xs text-stone-400 border-b border-stone-100 bg-stone-50/50"><th class="text-left font-bold px-3 py-2">Parameter</th><th class="text-right font-bold px-2 py-2">${fmtDate(RA.date)}</th><th class="text-right font-bold px-2 py-2">${fmtDate(RB.date)}</th><th class="text-right font-bold px-3 py-2">Δ</th></tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+      ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-xl mb-3"><div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI reading of these reports</p></div><p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p><p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p></div>`:''}
+      <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-2.5 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Reading the reports…':(state.compareInsight?'Re-interpret':'Ask AI to read these reports')}</button>
     </div>`;
   }
 
@@ -2417,31 +2446,37 @@ function renderTrends() {
 function mountTrendsCharts() { /* Trends is now a table — no charts */ }
 
 async function handleCompareInsight() {
-  const all = computeAllTests(state.currentId).filter(t => t.pts.length >= 2);
-  if (all.length === 0) return;
-  const canon = state.trendTest && all.some(t=>t.canon===state.trendTest) ? state.trendTest : all[0].canon;
-  const t = all.find(x => x.canon === canon); if (!t) return;
+  const reports = reportsWithLabs(state.currentId);
+  if (reports.length < 2) return;
   const m = currentMember();
-  const pts = t.pts;
-  const A = pts.find(p => p.date === (state.compareA || pts[0].date)) || pts[0];
-  const B = pts.find(p => p.date === (state.compareB || pts[pts.length-1].date)) || pts[pts.length-1];
-  const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}-${t.range.high}`:t.range.high!=null?`<${t.range.high}`:t.range.low!=null?`>${t.range.low}`:'unknown';
-  const prompt = `You are a careful health explainer for a family caregiver in India. Interpret the change in one lab value between two dates. Be factual, calm, and non-alarming. Do NOT diagnose. Explain what the test measures in one line, what the direction of change may suggest in general terms, and 1-2 practical, safe next steps. End by noting it's worth discussing with the doctor. Keep it under 120 words, plain English.
+  const bId = state.compareRepB && reports.some(r=>r.id===state.compareRepB) ? state.compareRepB : reports[0].id;
+  const aId = state.compareRepA && reports.some(r=>r.id===state.compareRepA) ? state.compareRepA : reports[1].id;
+  const RA = reports.find(r => r.id === aId), RB = reports.find(r => r.id === bId);
+  const params = [...new Set([...Object.keys(RA.vals), ...Object.keys(RB.vals)])];
+  const lines = params.map(p => {
+    const a = RA.vals[p], b = RB.vals[p];
+    const range = (a&&(a.range.low!=null||a.range.high!=null))?a.range:(b?b.range:{low:null,high:null});
+    const rangeTxt = range.low!=null&&range.high!=null?`ref ${range.low}-${range.high}`:range.high!=null?`ref <${range.high}`:range.low!=null?`ref >${range.low}`:'';
+    return `${p}: ${a?a.value:'—'} -> ${b?b.value:'—'} ${a?.unit||b?.unit||''} ${rangeTxt}`;
+  }).join('\n');
+
+  const prompt = `You are a careful health explainer for a family caregiver in India. Two lab reports for the same person are shown below. Give a brief, holistic reading of how things changed between the two dates. Be factual, calm and non-alarming. Do NOT diagnose. Point out which values moved meaningfully and in which direction, note anything now out of range, and give 1-3 practical, safe next steps. End by noting it's worth discussing with the doctor. Keep it under 150 words, plain English.
 
 Person: ${m.name}, ${m.age||'?'}y ${m.gender||''}. Known conditions: ${(m.conditions||[]).join(', ')||'none noted'}.
-Test: ${t.canon}
-Reference range: ${rangeTxt} ${t.unit||''}
-Earlier: ${A.value} ${A.unit||t.unit||''} on ${fmtDate(A.date)}
-Later: ${B.value} ${B.unit||t.unit||''} on ${fmtDate(B.date)}`;
+Earlier report — ${fmtDate(RA.date)} (${esc(RA.title)})
+Later report — ${fmtDate(RB.date)} (${esc(RB.title)})
+
+Values (earlier -> later):
+${lines}`;
 
   setState({ compareLoading: true });
   try {
     const res = await fetch(AI_ENDPOINT, {
       method: 'POST', headers: AI_HEADERS,
-      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 400, messages: [{ role: 'user', content: prompt }] })
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 500, messages: [{ role: 'user', content: prompt }] })
     });
     const d = await res.json();
-    setState({ compareLoading: false, compareInsight: d.content?.[0]?.text || 'Could not generate an interpretation. Please try again.' });
+    setState({ compareLoading: false, compareInsight: d.content?.[0]?.text || 'Could not generate a reading. Please try again.' });
   } catch {
     setState({ compareLoading: false, compareInsight: 'Connection error — please try again.' });
   }
@@ -3086,17 +3121,11 @@ document.addEventListener('click', async (e) => {
     case 'spend-filter':
       setState({ spendFilter: el.dataset.id });
       break;
-    case 'trend-set-test': {
-      const t = computeAllTests(state.currentId).find(x => x.canon === el.dataset.canon);
-      const pts = t ? t.pts : [];
-      setState({ trendTest: el.dataset.canon, compareA: pts[0]?.date || null, compareB: pts[pts.length-1]?.date || null, compareInsight: null });
+    case 'set-report-a':
+      setState({ compareRepA: el.dataset.id, compareInsight: null });
       break;
-    }
-    case 'set-compare-a':
-      setState({ compareA: el.dataset.date, compareInsight: null });
-      break;
-    case 'set-compare-b':
-      setState({ compareB: el.dataset.date, compareInsight: null });
+    case 'set-report-b':
+      setState({ compareRepB: el.dataset.id, compareInsight: null });
       break;
     case 'compare-insight':
       await handleCompareInsight();

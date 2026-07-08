@@ -833,6 +833,21 @@ async function saveUploadRecord(memberId) {
         });
       } catch (e) { /* non-fatal */ }
     }
+    // If the AI extracted medications, add them to this member's medicine list (dedupe by name)
+    if (Array.isArray(ext.medications) && ext.medications.length) {
+      try {
+        const existing = (state.allMedicines || []).filter(x => x.mid === memberId).map(x => (x.name||'').toLowerCase().trim());
+        for (const med of ext.medications) {
+          const nm = (med.name || '').trim();
+          if (!nm || existing.includes(nm.toLowerCase())) continue;
+          await db.addMedicine(state.session.user.id, {
+            mid: memberId, name: nm, dose: med.dose || null, freq: med.freq || null,
+            timing: med.duration || null, purpose: med.purpose || null, sourceRecordId: saved.id,
+          });
+          existing.push(nm.toLowerCase());
+        }
+      } catch (e) { /* non-fatal */ }
+    }
     // Switch active profile to the filed member so its episodes are in context for threading
     if (memberId !== state.currentId) { await switchMember(memberId); }
     // Refresh family-wide records so the Records page shows the new doc immediately
@@ -1813,7 +1828,7 @@ function renderSpending() {
                 </div>
                 <div class="text-right flex-shrink-0">
                   <p class="font-black text-stone-900 text-sm">${fmtINR(r.amount)}</p>
-                  <button data-action="cycle-claim" data-id="${r.id}" class="mt-1 text-xs font-bold px-2 py-0.5 rounded-full ${cs.cls}" title="Tap to change claim status">${cs.short}</button>
+                  <button data-action="cycle-claim" data-id="${r.id}" class="mt-1 text-xs font-bold px-2 py-0.5 rounded-full ${cs.cls}" title="Tap to change claim status">${(r.claimStatus||'none')==='none'?'+ To claim?':cs.short}</button>
                 </div>
               </div>`; }).join('')}
           </div>
@@ -2306,29 +2321,41 @@ function renderTrends() {
   const body = trends.length === 0
     ? `<div class="text-center py-16 text-stone-400">${iconHtml('trending-up',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No trends yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Upload at least two reports containing the same test (e.g. two LFTs) and ${esc(m.name.split(' ')[0])}'s values will chart here over time.</p></div>`
     : `<div class="space-y-3">${trends.map((t, i) => {
-        const chg = t.latest.value - t.prev.value;
-        const dirColor = t.outOfRange ? 'text-rose-600' : (t.dir==='flat'?'text-stone-400':'text-teal-600');
-        const dirIcon = t.dir==='up'?'trending-up':t.dir==='down'?'trending-down':'minus';
         const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`<${t.range.high}`:t.range.low!=null?`>${t.range.low}`:'';
         return `<div class="bg-white rounded-2xl p-4 border ${t.outOfRange?'border-rose-200':'border-stone-100'} shadow-sm">
           <div class="flex items-start justify-between mb-2">
             <div>
               <p class="font-bold text-stone-900 text-sm">${esc(t.canon)}</p>
-              <div class="flex items-baseline gap-2 mt-0.5">
-                <span class="text-2xl font-black ${t.outOfRange?'text-rose-600':'text-stone-900'}">${t.latest.value}</span>
-                <span class="text-xs text-stone-400">${esc(t.unit||'')}</span>
-                <span class="text-xs font-bold ${dirColor} flex items-center gap-0.5">${iconHtml(dirIcon,12)}${chg>0?'+':''}${(Math.round(chg*100)/100)}</span>
-              </div>
+              <p class="text-xs text-stone-400 mt-0.5">${t.pts.length} readings · ${fmtDate(t.pts[0].date)} → ${fmtDate(t.latest.date)}</p>
             </div>
             <div class="text-right">
+              <div class="flex items-baseline gap-1.5 justify-end">
+                <span class="text-2xl font-black ${t.outOfRange?'text-rose-600':'text-stone-900'}">${t.latest.value}</span>
+                <span class="text-xs text-stone-400">${esc(t.unit||'')}</span>
+              </div>
               ${t.outOfRange?badgeHtml('Out of range','bg-rose-50 text-rose-600'):badgeHtml('In range','bg-emerald-50 text-emerald-600')}
               ${rangeTxt?`<p class="text-xs text-stone-400 mt-1">ref: ${rangeTxt}</p>`:''}
             </div>
           </div>
-          <canvas id="trend-chart-${i}" height="90"></canvas>
-          <div class="flex items-center justify-between mt-2">
-            <p class="text-xs text-stone-400">${t.pts.length} readings · ${fmtDate(t.pts[0].date)} → ${fmtDate(t.latest.date)}</p>
-            ${t.pts.length>=2?`<button data-action="open-compare" data-canon="${esc(t.canon)}" class="text-xs font-bold text-teal-600 hover:underline flex items-center gap-1">${iconHtml('git-compare',12)} Compare</button>`:''}
+          <div class="rounded-xl border border-stone-100 overflow-hidden">
+            <table class="w-full text-sm">
+              <tbody>
+                ${t.pts.slice().reverse().map((p, idx, arr) => {
+                  const pOor = (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
+                  const prevVal = idx < arr.length-1 ? arr[idx+1].value : null;
+                  const d = prevVal!=null ? Math.round((p.value-prevVal)*100)/100 : null;
+                  return `<tr class="${idx%2?'bg-stone-50/50':''} border-b border-stone-50 last:border-0">
+                    <td class="px-3 py-2 text-stone-500 text-xs">${fmtDate(p.date)}</td>
+                    <td class="px-3 py-2 text-right font-bold ${pOor?'text-rose-600':'text-stone-800'}">${p.value} <span class="text-xs font-normal text-stone-400">${esc(p.unit||t.unit||'')}</span></td>
+                    <td class="px-3 py-2 text-right text-xs font-semibold ${d==null?'text-stone-300':d>0?'text-rose-400':d<0?'text-teal-500':'text-stone-300'}">${d==null?'—':(d>0?'▲ +':d<0?'▼ ':'')+(d!==0?d:'0')}</td>
+                  </tr>`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+          <div class="flex items-center gap-3 mt-3">
+            <button data-action="open-compare" data-canon="${esc(t.canon)}" class="flex-1 py-2 rounded-lg text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('git-compare',13)} Compare readings</button>
+            <button data-action="open-compare" data-canon="${esc(t.canon)}" class="flex-1 py-2 rounded-lg text-xs font-bold text-white hover:opacity-90 flex items-center justify-center gap-1" style="background:${C.teal}">${iconHtml('sparkles',13)} AI insight</button>
           </div>
           ${t.outOfRange?`<div class="mt-2 p-2 bg-amber-50 rounded-lg flex items-start gap-2">${iconHtml('info',13,'text-amber-500 flex-shrink-0 mt-0.5')}<p class="text-xs text-amber-700">Latest reading is outside the reference range — worth asking ${esc(m.name.split(' ')[0])}'s doctor about.</p></div>`:''}
         </div>`;
@@ -2341,39 +2368,7 @@ function renderTrends() {
   </div>`;
 }
 
-function mountTrendsCharts() {
-  const trends = computeTrends(state.currentId);
-  trends.forEach((t, i) => {
-    const el = document.getElementById(`trend-chart-${i}`);
-    if (!el) return;
-    destroyChart(`trend-chart-${i}`);
-    const labels = t.pts.map(p => new Date(p.date).toLocaleDateString('en-IN',{month:'short',year:'2-digit'}));
-    const data = t.pts.map(p => p.value);
-    const annotations = [];
-    chartRegistry[`trend-chart-${i}`] = new Chart(el.getContext('2d'), {
-      type: 'line',
-      data: { labels, datasets: [{
-        data, borderColor: t.outOfRange ? '#e11d48' : C.teal, backgroundColor: (t.outOfRange?'#e11d48':C.teal)+'22',
-        borderWidth: 2, tension: 0.3, fill: true, pointRadius: 3, pointBackgroundColor: t.pts.map(p => {
-          const oor = (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
-          return oor ? '#e11d48' : (t.outOfRange?'#e11d48':C.teal);
-        }),
-      }]},
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { enabled: true } },
-        scales: {
-          x: { grid: { display: false }, ticks: { font: { size: 9 }, color: '#a8a29e' } },
-          y: {
-            grid: { color: '#f5f5f4' }, ticks: { font: { size: 9 }, color: '#a8a29e' },
-            suggestedMin: t.range.low != null ? Math.min(t.range.low, ...data) : undefined,
-            suggestedMax: t.range.high != null ? Math.max(t.range.high, ...data) : undefined,
-          },
-        },
-      },
-    });
-  });
-}
+function mountTrendsCharts() { /* Trends is now a table — no charts */ }
 
 // ── Trend comparison (pick two readings + AI insight) ──
 function trendByCanon(canon) {
@@ -2507,7 +2502,7 @@ function renderMedicines() {
           </div>
         </div>`).join('')}</div>`;
   return `<div class="fade-in max-w-2xl">
-    <div class="flex items-center justify-between mb-1"><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medicines</h1><button data-action="medicine-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add</button></div>
+    <div class="flex items-center justify-between mb-1"><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medicines</h1>${meds.length?`<button data-action="medicine-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add</button>`:''}</div>
     <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · ${meds.length} active</p>
     ${body}
   </div>`;
@@ -2569,10 +2564,12 @@ function renderDoctors() {
   const suggestHtml = suggestions.length === 0 ? '' : `
     <p class="text-xs font-black text-stone-400 uppercase tracking-wider mb-2">Found in your records</p>
     <div class="space-y-2 mb-5">${suggestions.map(s => `
-      <div class="flex items-center gap-3 bg-stone-50 rounded-xl p-3">
-        <div class="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml('stethoscope',15,'')}</div>
-        <div class="flex-1 min-w-0"><p class="font-semibold text-stone-800 text-sm truncate">${esc(s.name)}</p><p class="text-xs text-stone-400">${s.hospital?esc(s.hospital)+' · ':''}${s.count} record${s.count!==1?'s':''}</p></div>
-        <button data-action="doctor-add-suggested" data-name="${esc(s.name)}" data-hospital="${esc(s.hospital)}" class="px-3 py-1.5 rounded-lg text-xs font-bold text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',12,'inline')} Add</button>
+      <div class="bg-white rounded-2xl p-4 border border-dashed border-stone-200 shadow-sm">
+        <div class="flex items-start gap-3">
+          <div class="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml('stethoscope',18,'')}</div>
+          <div class="flex-1 min-w-0"><p class="font-bold text-stone-900 text-sm truncate">${esc(s.name)}</p><p class="text-xs text-stone-400 mt-0.5">${s.hospital?esc(s.hospital)+' · ':''}${s.count} record${s.count!==1?'s':''} · not saved yet</p></div>
+          <button data-action="doctor-add-suggested" data-name="${esc(s.name)}" data-hospital="${esc(s.hospital)}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400" title="Save & edit">${iconHtml('pencil',14)}</button>
+        </div>
       </div>`).join('')}</div>`;
 
   const empty = saved.length === 0 && suggestions.length === 0

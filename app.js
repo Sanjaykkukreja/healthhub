@@ -50,6 +50,10 @@ let state = {
   allRecords: [],             // family-wide records (all members) for the Records page
   allEpisodes: [],            // family-wide episodes
   allFollowups: [],           // family-wide follow-ups (dated next-actions)
+  allMedicines: [],           // family-wide medicines
+  allDoctors: [],             // family-wide doctors directory
+  medicineEditor: null,       // add/edit medicine modal
+  doctorEditor: null,         // add/edit doctor modal
   followupEditor: null,       // { id?, mid, title, kind, dueDate, notes } add/edit follow-up modal
   followupSaving: false,
   familyView: true,           // true = Whole Family (all pages); false = the single member in currentId
@@ -62,6 +66,9 @@ let state = {
   editingRecordDate: null,    // recordId whose date is being edited inline
   editingRecordAmount: null,  // recordId whose amount is being edited inline
   spendFilter: 'all',         // Spending page claim-status filter
+  compareModal: null,         // { canon } — trend comparison modal
+  compareA: null, compareB: null,  // selected reading dates
+  compareInsight: null, compareLoading: false,
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -255,6 +262,48 @@ const db = {
   },
   async deleteFollowup(id) {
     const { error } = await supabaseClient.from('followups').delete().eq('id', id);
+    if (error) throw error;
+  },
+  // ── Medicines ──
+  async getAllMedicines(userId) {
+    const { data, error } = await supabaseClient.from('medicines').select('*').eq('owner_id', userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    return data.map(m => ({ id:m.id, mid:m.member_id, name:m.name, dose:m.dose, freq:m.freq, timing:m.timing, purpose:m.purpose, active:m.active!==false, sourceRecordId:m.source_record_id }));
+  },
+  async addMedicine(userId, m) {
+    const { data, error } = await supabaseClient.from('medicines').insert([{ owner_id:userId, member_id:m.mid, name:m.name, dose:m.dose||null, freq:m.freq||null, timing:m.timing||null, purpose:m.purpose||null, active:true, source_record_id:m.sourceRecordId||null }]).select().single();
+    if (error) throw error;
+    return { id:data.id, mid:m.mid, name:m.name, dose:m.dose, freq:m.freq, timing:m.timing, purpose:m.purpose, active:true };
+  },
+  async updateMedicine(id, patch) {
+    const upd = {}; const map = { name:'name', dose:'dose', freq:'freq', timing:'timing', purpose:'purpose', active:'active' };
+    for (const k in patch) if (map[k]) upd[map[k]] = patch[k];
+    const { error } = await supabaseClient.from('medicines').update(upd).eq('id', id);
+    if (error) throw error;
+  },
+  async deleteMedicine(id) {
+    const { error } = await supabaseClient.from('medicines').delete().eq('id', id);
+    if (error) throw error;
+  },
+  // ── Doctors ──
+  async getAllDoctors(userId) {
+    const { data, error } = await supabaseClient.from('doctors').select('*').eq('owner_id', userId).order('created_at', { ascending: false });
+    if (error) throw error;
+    return data.map(d => ({ id:d.id, name:d.name, specialty:d.specialty, hospital:d.hospital, phone:d.phone, notes:d.notes }));
+  },
+  async addDoctor(userId, d) {
+    const { data, error } = await supabaseClient.from('doctors').insert([{ owner_id:userId, name:d.name, specialty:d.specialty||null, hospital:d.hospital||null, phone:d.phone||null, notes:d.notes||null }]).select().single();
+    if (error) throw error;
+    return { id:data.id, name:d.name, specialty:d.specialty, hospital:d.hospital, phone:d.phone, notes:d.notes };
+  },
+  async updateDoctor(id, patch) {
+    const upd = {}; const map = { name:'name', specialty:'specialty', hospital:'hospital', phone:'phone', notes:'notes' };
+    for (const k in patch) if (map[k]) upd[map[k]] = patch[k];
+    const { error } = await supabaseClient.from('doctors').update(upd).eq('id', id);
+    if (error) throw error;
+  },
+  async deleteDoctor(id) {
+    const { error } = await supabaseClient.from('doctors').delete().eq('id', id);
     if (error) throw error;
   },
   async addMember(userId, data) {
@@ -710,7 +759,7 @@ const PROGRESS_STEPS = [
   { pct: 90, msg: 'Verifying patient name…' }, { pct: 98, msg: 'Almost done…' },
 ];
 function openUploadModal() {
-  setState({ uploadModal: { phase: 'select', file: null, ext: null, pct: 0, progressMsg: '', errMsg: '', mismatchName: '', uploading: false } });
+  setState({ uploadModal: { phase: 'select', uploadMode: 'ai', file: null, ext: null, pct: 0, progressMsg: '', errMsg: '', mismatchName: '', uploading: false } });
 }
 function closeUploadModal() { setState({ uploadModal: null }); }
 
@@ -871,10 +920,18 @@ function renderUploadModal() {
   let body = '';
 
   if (um.phase === 'select') {
+    const manual = um.uploadMode === 'manual';
     body = `
       <div class="space-y-3">
         <input type="file" id="upload-file-input" accept="image/*,.pdf,.heic,.heif" class="hidden"/>
         <input type="file" id="upload-camera-input" accept="image/*" capture="environment" class="hidden"/>
+
+        <!-- AI vs Manual toggle -->
+        <div class="inline-flex bg-stone-100 rounded-xl p-1 w-full">
+          <button data-action="set-upload-mode" data-mode="ai" class="flex-1 px-3 py-2 rounded-lg text-xs font-bold transition-colors flex items-center justify-center gap-1.5" style="${!manual?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('sparkles',13)} AI reads it</button>
+          <button data-action="set-upload-mode" data-mode="manual" class="flex-1 px-3 py-2 rounded-lg text-xs font-bold transition-colors flex items-center justify-center gap-1.5" style="${manual?`background:white;color:${C.teal};box-shadow:0 1px 2px rgba(0,0,0,0.08)`:'color:#78716c'}">${iconHtml('pencil',13)} I'll enter details</button>
+        </div>
+
         <div id="upload-dropzone" class="border-2 border-dashed border-stone-200 rounded-2xl p-8 flex flex-col items-center gap-3 hover:border-teal-400 hover:bg-teal-50 transition-all cursor-pointer">
           <div class="w-16 h-16 rounded-2xl bg-stone-100 flex items-center justify-center">${iconHtml('file-up', 28, 'text-stone-400')}</div>
           <div class="text-center"><p class="font-bold text-stone-800 text-sm">Tap to select · or drag a file here</p><p class="text-xs text-stone-400 mt-1">PDF, JPG, PNG, HEIC · Max 25 MB</p></div>
@@ -882,14 +939,18 @@ function renderUploadModal() {
         <button id="upload-camera-btn" class="w-full flex items-center justify-center gap-2.5 py-3.5 border border-stone-200 rounded-xl text-sm font-bold text-stone-600 hover:bg-stone-50 transition-colors">
           ${iconHtml('camera', 18, 'text-teal-600')} Take a photo of document
         </button>
-        <div class="bg-stone-50 rounded-2xl p-4">
-          <p class="text-xs font-bold text-stone-500 mb-3 flex items-center gap-1.5">${iconHtml('info',12)} AI reads any Indian medical document:</p>
-          <div class="grid grid-cols-2 gap-y-2 gap-x-3 text-xs text-stone-500">
-            ${['Handwritten prescriptions','Lab reports (any Indian lab)','Hospital bills & invoices','X-ray / MRI / CT reports','Discharge summaries','Hindi + English mixed text','iPhone photos at angle','Insurance documents'].map(x=>`<div class="flex items-start gap-1.5">${iconHtml('check',11,'text-emerald-500')}${x}</div>`).join('')}
-          </div>
-        </div>
+        ${manual
+          ? `<div class="bg-teal-50 rounded-2xl p-4 border border-teal-100"><p class="text-xs text-teal-800 flex items-start gap-2">${iconHtml('info',13,'text-teal-600 flex-shrink-0 mt-0.5')} <span><strong>Manual mode:</strong> your file is stored, then you type the details yourself. AI won't run (saves cost, works even with no credit).</span></p>
+              <button data-action="upload-manual" class="w-full text-center text-xs font-bold text-teal-700 hover:underline mt-2 pt-2 border-t border-teal-100">Skip file — just enter details</button>
+            </div>`
+          : `<div class="bg-stone-50 rounded-2xl p-4">
+              <p class="text-xs font-bold text-stone-500 mb-3 flex items-center gap-1.5">${iconHtml('info',12)} AI reads any Indian medical document:</p>
+              <div class="grid grid-cols-2 gap-y-2 gap-x-3 text-xs text-stone-500">
+                ${['Handwritten prescriptions','Lab reports (any Indian lab)','Hospital bills & invoices','X-ray / MRI / CT reports','Discharge summaries','Hindi + English mixed text','iPhone photos at angle','Insurance documents'].map(x=>`<div class="flex items-start gap-1.5">${iconHtml('check',11,'text-emerald-500')}${x}</div>`).join('')}
+              </div>
+            </div>`
+        }
         <p class="text-xs text-stone-400 text-center">🔒 Files stored privately in your Supabase vault · Never shared</p>
-        <button data-action="upload-manual" class="w-full text-center text-xs font-bold text-teal-600 hover:underline pt-1">Or enter details manually (skip AI)</button>
       </div>`;
   } else if (um.phase === 'analysing') {
     body = `
@@ -1192,7 +1253,7 @@ function renderRecords() {
         ${(() => { const ts = typeStyle(sel.type); return `<div class="flex items-center gap-2 px-3 py-2 rounded-xl ${ts.bg} ${ts.text} text-sm font-bold mb-3">${iconHtml(ts.icon,16)}<span>${ts.label}</span>${sel.source==='upload'?badgeHtml('AI','ml-auto bg-teal-100 text-teal-700 text-xs'):''}</div>`; })()}
         ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
         <div class="space-y-2.5 text-sm">
-          ${dateEditRowHtml(sel)}${amountEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+          ${dateEditRowHtml(sel)}${amountEditRowHtml(sel)}${claimRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
         </div>
         ${sel.extracted ? `<div class="mt-4 pt-4 border-t border-stone-100 space-y-3">
           <p class="text-xs font-bold text-stone-400 uppercase tracking-wider">AI Extracted</p>
@@ -1411,9 +1472,20 @@ function amountEditRowHtml(sel) {
         <button data-action="save-record-amount" data-id="${sel.id}" class="px-3 py-2 rounded-lg text-xs font-bold text-white" style="background:${C.teal}">Save</button>
         <button data-action="cancel-record-amount" class="px-3 py-2 rounded-lg text-xs font-bold border border-stone-200 text-stone-500">Cancel</button>
       </div>
+      ${sel.amount!=null?`<button data-action="clear-record-amount" data-id="${sel.id}" class="text-xs font-bold text-rose-500 hover:underline mt-2">Remove from spending (keep document)</button>`:''}
     </div>`;
   }
   return `<div class="flex items-center justify-between"><div><p class="text-xs text-stone-400">Amount</p><p class="font-semibold text-stone-800">${sel.amount!=null?fmtINR(sel.amount):'—'}</p></div><button data-action="edit-record-amount" data-id="${sel.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400" title="Edit amount">${iconHtml('pencil',13)}</button></div>`;
+}
+
+// Claim-status row for the record detail (only meaningful when there's an amount)
+function claimRowHtml(sel) {
+  if (sel.amount == null || sel.amount <= 0) return '';
+  const cs = CLAIM_STATES[sel.claimStatus || 'none'];
+  return `<div class="flex items-center justify-between">
+    <div><p class="text-xs text-stone-400">Insurance</p><p class="font-semibold text-stone-800">${cs.label}</p></div>
+    <button data-action="cycle-claim" data-id="${sel.id}" class="text-xs font-bold px-2.5 py-1 rounded-full ${cs.cls}" title="Tap to change">${cs.short === '—' ? 'Mark to claim' : 'Change'}</button>
+  </div>`;
 }
 
 // A lightweight record-detail modal (used from episode view where there's no side panel)
@@ -1438,7 +1510,7 @@ function renderRecordDetailModal(sel) {
       ${sel.filePath ? `<button data-action="view-original" data-id="${sel.id}" class="w-full mb-3 py-2.5 rounded-xl text-sm font-bold flex items-center justify-center gap-2 text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('file-text',15)} View original document</button>` : ''}
 
       <div class="space-y-2.5 text-sm">
-        ${dateEditRowHtml(sel)}${amountEditRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
+        ${dateEditRowHtml(sel)}${amountEditRowHtml(sel)}${claimRowHtml(sel)}${[{l:'Doctor',v:sel.doctor},{l:'Facility',v:sel.hospital},{l:'File',v:sel.uploadedFile}].filter(x=>x.v).map(x=>`<div><p class="text-xs text-stone-400">${x.l}</p><p class="font-semibold text-stone-800">${esc(x.v)}</p></div>`).join('')}
       </div>
       ${sel.summary?`<div class="mt-3 p-3 bg-teal-50 rounded-xl"><p class="text-xs font-bold text-teal-700 mb-0.5">Summary</p><p class="text-sm text-teal-800">${esc(sel.summary)}</p></div>`:''}
       ${ex.diagnosis?`<div class="mt-3"><p class="text-xs text-stone-400">Diagnosis</p><p class="text-sm text-stone-800">${esc(ex.diagnosis)}</p></div>`:''}
@@ -1733,7 +1805,7 @@ function renderSpending() {
               <div class="bg-white rounded-xl p-3 border border-stone-100 shadow-sm flex items-center gap-3">
                 <div class="p-2 rounded-lg ${ts.bg} ${ts.text} flex-shrink-0 cursor-pointer" data-action="select-record" data-id="${r.id}">${iconHtml(ts.icon,15)}</div>
                 <div class="flex-1 min-w-0 cursor-pointer" data-action="select-record" data-id="${r.id}">
-                  <p class="font-bold text-stone-900 text-sm truncate">${esc(r.title)}</p>
+                  <p class="font-bold text-stone-900 text-sm truncate flex items-center gap-1.5">${esc(r.title)}${r.filePath?iconHtml('paperclip',11,'text-stone-300 flex-shrink-0'):''}</p>
                   <div class="flex items-center gap-1.5 mt-0.5">
                     ${mem?`<span class="inline-flex items-center gap-1"><span class="w-3.5 h-3.5 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:8px;font-weight:800">${mem.avatar}</span><span class="text-xs font-semibold text-stone-500">${esc(mem.name.split(' ')[0])}</span></span><span class="text-stone-300 text-xs">·</span>`:''}
                     <span class="text-xs text-stone-400">${fmtDate(r.date)}</span>
@@ -2254,7 +2326,10 @@ function renderTrends() {
             </div>
           </div>
           <canvas id="trend-chart-${i}" height="90"></canvas>
-          <p class="text-xs text-stone-400 mt-2">${t.pts.length} readings · ${fmtDate(t.pts[0].date)} → ${fmtDate(t.latest.date)}</p>
+          <div class="flex items-center justify-between mt-2">
+            <p class="text-xs text-stone-400">${t.pts.length} readings · ${fmtDate(t.pts[0].date)} → ${fmtDate(t.latest.date)}</p>
+            ${t.pts.length>=2?`<button data-action="open-compare" data-canon="${esc(t.canon)}" class="text-xs font-bold text-teal-600 hover:underline flex items-center gap-1">${iconHtml('git-compare',12)} Compare</button>`:''}
+          </div>
           ${t.outOfRange?`<div class="mt-2 p-2 bg-amber-50 rounded-lg flex items-start gap-2">${iconHtml('info',13,'text-amber-500 flex-shrink-0 mt-0.5')}<p class="text-xs text-amber-700">Latest reading is outside the reference range — worth asking ${esc(m.name.split(' ')[0])}'s doctor about.</p></div>`:''}
         </div>`;
       }).join('')}</div>`;
@@ -2298,6 +2373,238 @@ function mountTrendsCharts() {
       },
     });
   });
+}
+
+// ── Trend comparison (pick two readings + AI insight) ──
+function trendByCanon(canon) {
+  return computeTrends(state.currentId).find(t => t.canon === canon);
+}
+function renderCompareModal() {
+  const cm = state.compareModal;
+  if (!cm) return '';
+  const t = trendByCanon(cm.canon);
+  if (!t) return '';
+  const m = currentMember();
+  const pts = t.pts;
+  const aDate = state.compareA || pts[0].date;
+  const bDate = state.compareB || pts[pts.length-1].date;
+  const A = pts.find(p => p.date === aDate) || pts[0];
+  const B = pts.find(p => p.date === bDate) || pts[pts.length-1];
+  const oor = (p) => (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
+  const delta = Math.round((B.value - A.value) * 100) / 100;
+  const pct = A.value ? Math.round((B.value - A.value) / A.value * 100) : null;
+  const dir = delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat';
+  const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`< ${t.range.high}`:t.range.low!=null?`> ${t.range.low}`:'not specified';
+
+  const readingCol = (p, label, showDelta) => `
+    <div class="flex-1 p-3 rounded-2xl ${oor(p)?'bg-rose-50 border border-rose-100':'bg-stone-50 border border-stone-100'}">
+      <p class="text-xs font-bold text-stone-400 uppercase tracking-wide">${label}</p>
+      <p class="text-xs text-stone-400 mt-0.5">${fmtDate(p.date)}</p>
+      <p class="text-3xl font-black mt-1 ${oor(p)?'text-rose-600':'text-stone-900'}">${p.value}<span class="text-sm font-bold text-stone-400 ml-1">${esc(p.unit||t.unit||'')}</span></p>
+      ${oor(p)?`<p class="text-xs font-bold text-rose-600 mt-1">Out of range</p>`:`<p class="text-xs font-bold text-emerald-600 mt-1">In range</p>`}
+      ${showDelta&&delta!==0?`<div class="mt-2 pt-2 border-t border-stone-200/60 flex items-center gap-1 text-sm font-black ${dir==='up'?'text-rose-500':'text-teal-600'}">${iconHtml(dir==='up'?'trending-up':'trending-down',14)} ${delta>0?'+':''}${delta}${pct!=null?` (${pct>0?'+':''}${pct}%)`:''}</div>`:''}
+    </div>`;
+
+  const chip = (p, which) => {
+    const sel = which==='a' ? aDate===p.date : bDate===p.date;
+    return `<button data-action="set-compare-${which}" data-date="${p.date}" class="px-2.5 py-1 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${sel?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${sel?`background:${C.teal}`:''}">${fmtDate(p.date)}</button>`;
+  };
+
+  return `
+  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="compare-backdrop">
+    <div class="bg-white w-full md:max-w-lg rounded-t-3xl md:rounded-2xl p-5 shadow-2xl max-h-[92dvh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-1">
+        <h3 class="font-bold text-stone-900 text-lg">${esc(t.canon)}</h3>
+        <button data-action="close-compare">${iconHtml('x',18,'text-stone-400')}</button>
+      </div>
+      <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · reference range ${rangeTxt}</p>
+
+      <div class="flex gap-3 mb-3">
+        ${readingCol(A, 'Earlier', false)}
+        <div class="flex items-center">${iconHtml('arrow-right',18,'text-stone-300')}</div>
+        ${readingCol(B, 'Later', true)}
+      </div>
+
+      <div class="space-y-2 mb-4">
+        <div><p class="text-xs font-bold text-stone-400 mb-1">Earlier reading</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${pts.map(p=>chip(p,'a')).join('')}</div></div>
+        <div><p class="text-xs font-bold text-stone-400 mb-1">Later reading</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${pts.map(p=>chip(p,'b')).join('')}</div></div>
+      </div>
+
+      ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-2xl mb-3">
+        <div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI interpretation</p></div>
+        <p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p>
+        <p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p>
+      </div>` : ''}
+
+      <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">
+        ${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Thinking…':(state.compareInsight?'Re-interpret this change':'Ask AI to interpret this change')}
+      </button>
+    </div>
+  </div>`;
+}
+
+async function handleCompareInsight() {
+  const cm = state.compareModal; if (!cm) return;
+  const t = trendByCanon(cm.canon); if (!t) return;
+  const m = currentMember();
+  const pts = t.pts;
+  const A = pts.find(p => p.date === (state.compareA || pts[0].date)) || pts[0];
+  const B = pts.find(p => p.date === (state.compareB || pts[pts.length-1].date)) || pts[pts.length-1];
+  const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}-${t.range.high}`:t.range.high!=null?`<${t.range.high}`:t.range.low!=null?`>${t.range.low}`:'unknown';
+  const prompt = `You are a careful health explainer for a family caregiver in India. Interpret the change in one lab value between two dates. Be factual, calm, and non-alarming. Do NOT diagnose. Explain what the test measures in one line, what the direction of change may suggest in general terms, and 1-2 practical, safe next steps. End by noting it's worth discussing with the doctor. Keep it under 120 words, plain English.
+
+Person: ${m.name}, ${m.age||'?'}y ${m.gender||''}. Known conditions: ${(m.conditions||[]).join(', ')||'none noted'}.
+Test: ${t.canon}
+Reference range: ${rangeTxt} ${t.unit||''}
+Earlier: ${A.value} ${A.unit||t.unit||''} on ${fmtDate(A.date)}
+Later: ${B.value} ${B.unit||t.unit||''} on ${fmtDate(B.date)}`;
+
+  setState({ compareLoading: true });
+  try {
+    const res = await fetch(AI_ENDPOINT, {
+      method: 'POST', headers: AI_HEADERS,
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 400, messages: [{ role: 'user', content: prompt }] })
+    });
+    const d = await res.json();
+    setState({ compareLoading: false, compareInsight: d.content?.[0]?.text || 'Could not generate an interpretation. Please try again.' });
+  } catch {
+    setState({ compareLoading: false, compareInsight: 'Connection error — please try again.' });
+  }
+}
+
+// ═════════════════════════════════════════
+//  MEDICINES  (per-person list + reminders)
+// ═════════════════════════════════════════
+function medReminderUrl(med, member) {
+  const today = new Date();
+  const start = `${today.getFullYear()}${String(today.getMonth()+1).padStart(2,'0')}${String(today.getDate()).padStart(2,'0')}`;
+  const d2 = new Date(today); d2.setDate(d2.getDate()+1);
+  const end = `${d2.getFullYear()}${String(d2.getMonth()+1).padStart(2,'0')}${String(d2.getDate()).padStart(2,'0')}`;
+  const text = encodeURIComponent(`💊 ${med.name}${med.dose?` (${med.dose})`:''}${member?` — ${member.name.split(' ')[0]}`:''}`);
+  const details = encodeURIComponent(`${med.freq||''}${med.timing?` · ${med.timing}`:''}${med.purpose?`\nFor: ${med.purpose}`:''}\n\nvia HealthHub`);
+  return `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${text}&dates=${start}/${end}&details=${details}&recur=RRULE:FREQ=DAILY`;
+}
+
+function renderMedicines() {
+  const m = currentMember();
+  const meds = state.allMedicines.filter(x => x.mid === state.currentId && x.active);
+  const body = meds.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('pill',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No medicines yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Add ${esc(m.name.split(' ')[0])}'s medicines to keep a clear list and set daily reminders.</p><button data-action="medicine-add" class="mt-4 px-5 py-2.5 text-white rounded-xl text-sm font-bold inline-flex items-center gap-2 hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add Medicine</button></div>`
+    : `<div class="space-y-2.5">${meds.map(md => `
+        <div class="bg-white rounded-2xl p-4 border border-stone-100 shadow-sm">
+          <div class="flex items-start gap-3">
+            <div class="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml('pill',18,'')}</div>
+            <div class="flex-1 min-w-0">
+              <p class="font-bold text-stone-900 text-sm">${esc(md.name)}${md.dose?` · ${esc(md.dose)}`:''}</p>
+              <p class="text-xs text-stone-500 mt-0.5">${[md.freq,md.timing].filter(Boolean).map(esc).join(' · ')||'No schedule set'}</p>
+              ${md.purpose?`<p class="text-xs text-stone-400 mt-0.5">For: ${esc(md.purpose)}</p>`:''}
+            </div>
+            <button data-action="medicine-edit" data-id="${md.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400">${iconHtml('pencil',14)}</button>
+          </div>
+          <div class="flex gap-2 mt-3 pl-13">
+            <a href="${medReminderUrl(md, m)}" target="_blank" class="flex-1 py-1.5 rounded-lg text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50 text-center flex items-center justify-center gap-1">${iconHtml('bell',12)} Daily reminder</a>
+            <button data-action="medicine-delete" data-id="${md.id}" class="px-3 py-1.5 rounded-lg text-xs font-bold border border-rose-200 text-rose-600 hover:bg-rose-50">${iconHtml('trash-2',12)}</button>
+          </div>
+        </div>`).join('')}</div>`;
+  return `<div class="fade-in max-w-2xl">
+    <div class="flex items-center justify-between mb-1"><h1 class="text-xl md:text-2xl font-bold text-stone-900">Medicines</h1><button data-action="medicine-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add</button></div>
+    <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · ${meds.length} active</p>
+    ${body}
+  </div>`;
+}
+
+function renderMedicineEditor() {
+  const ed = state.medicineEditor; if (!ed) return '';
+  const isEdit = !!ed.id;
+  const f = (id,label,ph='') => `<div><label class="block text-xs font-bold text-stone-500 mb-1">${label}</label><input id="med-${id}" value="${ed[id]!=null?esc(String(ed[id])):''}" placeholder="${ph}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>`;
+  return `<div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="medicine-editor-backdrop">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-6 shadow-2xl max-h-[90dvh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-4"><h3 class="font-bold text-stone-900 text-lg">${isEdit?'Edit Medicine':'Add Medicine'}</h3><button data-action="close-medicine-editor">${iconHtml('x',18,'text-stone-400')}</button></div>
+      <div class="space-y-3">
+        ${f('name','Medicine name *','e.g. Metformin')}
+        <div class="grid grid-cols-2 gap-3">${f('dose','Dose','e.g. 500mg')}${f('freq','Frequency','e.g. Twice a day')}</div>
+        ${f('timing','Timing','e.g. After food · 8am, 8pm')}
+        ${f('purpose','For (condition)','e.g. Diabetes')}
+      </div>
+      <div class="flex gap-3 mt-5">
+        ${isEdit?`<button data-action="medicine-delete" data-id="${ed.id}" class="py-3 px-4 border border-rose-200 text-rose-600 rounded-xl text-sm font-bold">${iconHtml('trash-2',15)}</button>`:''}
+        <button data-action="close-medicine-editor" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
+        <button id="med-save" class="flex-1 py-3 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${C.teal}">${isEdit?'Save':'Add'}</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ═════════════════════════════════════════
+//  DOCTORS  (family directory, auto-built)
+// ═════════════════════════════════════════
+function renderDoctors() {
+  const saved = state.allDoctors;
+  const savedNames = new Set(saved.map(d => (d.name||'').toLowerCase().trim()));
+  // Auto-suggest doctors seen in records that aren't saved yet
+  const seen = {};
+  state.allRecords.forEach(r => {
+    const n = (r.doctor||'').trim();
+    if (n && !savedNames.has(n.toLowerCase())) {
+      if (!seen[n]) seen[n] = { name:n, hospital:r.hospital||'', count:0 };
+      seen[n].count++;
+    }
+  });
+  const suggestions = Object.values(seen).sort((a,b)=>b.count-a.count).slice(0,10);
+
+  const savedHtml = saved.length === 0 ? '' : `<div class="space-y-2.5 mb-5">${saved.map(d => `
+    <div class="bg-white rounded-2xl p-4 border border-stone-100 shadow-sm">
+      <div class="flex items-start gap-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml('stethoscope',18,'')}</div>
+        <div class="flex-1 min-w-0">
+          <p class="font-bold text-stone-900 text-sm">${esc(d.name)}</p>
+          <p class="text-xs text-stone-500 mt-0.5">${[d.specialty,d.hospital].filter(Boolean).map(esc).join(' · ')||'—'}</p>
+          ${d.notes?`<p class="text-xs text-stone-400 mt-0.5">${esc(d.notes)}</p>`:''}
+        </div>
+        <button data-action="doctor-edit" data-id="${d.id}" class="p-1.5 rounded-lg hover:bg-stone-100 text-stone-400">${iconHtml('pencil',14)}</button>
+      </div>
+      ${d.phone?`<div class="flex gap-2 mt-3"><a href="tel:${esc(d.phone)}" class="flex-1 py-1.5 rounded-lg text-xs font-bold text-white text-center flex items-center justify-center gap-1 hover:opacity-90" style="background:${C.teal}">${iconHtml('phone',12)} ${esc(d.phone)}</a></div>`:`<button data-action="doctor-edit" data-id="${d.id}" class="text-xs font-bold text-teal-600 hover:underline mt-2">+ Add phone number</button>`}
+    </div>`).join('')}</div>`;
+
+  const suggestHtml = suggestions.length === 0 ? '' : `
+    <p class="text-xs font-black text-stone-400 uppercase tracking-wider mb-2">Found in your records</p>
+    <div class="space-y-2 mb-5">${suggestions.map(s => `
+      <div class="flex items-center gap-3 bg-stone-50 rounded-xl p-3">
+        <div class="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0" style="background:${C.teal}1a">${iconHtml('stethoscope',15,'')}</div>
+        <div class="flex-1 min-w-0"><p class="font-semibold text-stone-800 text-sm truncate">${esc(s.name)}</p><p class="text-xs text-stone-400">${s.hospital?esc(s.hospital)+' · ':''}${s.count} record${s.count!==1?'s':''}</p></div>
+        <button data-action="doctor-add-suggested" data-name="${esc(s.name)}" data-hospital="${esc(s.hospital)}" class="px-3 py-1.5 rounded-lg text-xs font-bold text-white hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',12,'inline')} Add</button>
+      </div>`).join('')}</div>`;
+
+  const empty = saved.length === 0 && suggestions.length === 0
+    ? `<div class="text-center py-16 text-stone-400">${iconHtml('stethoscope',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No doctors yet</p><p class="text-sm mt-1">As you upload documents, doctors are detected here. Or add one manually.</p></div>` : '';
+
+  return `<div class="fade-in max-w-2xl">
+    <div class="flex items-center justify-between mb-1"><h1 class="text-xl md:text-2xl font-bold text-stone-900">Doctors</h1><button data-action="doctor-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add</button></div>
+    <p class="text-xs text-stone-400 mb-4">${saved.length} saved${suggestions.length?` · ${suggestions.length} found in records`:''}</p>
+    ${savedHtml}${suggestHtml}${empty}
+  </div>`;
+}
+
+function renderDoctorEditor() {
+  const ed = state.doctorEditor; if (!ed) return '';
+  const isEdit = !!ed.id;
+  const f = (id,label,ph='',type='text') => `<div><label class="block text-xs font-bold text-stone-500 mb-1">${label}</label><input id="doc-${id}" type="${type}" value="${ed[id]!=null?esc(String(ed[id])):''}" placeholder="${ph}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>`;
+  return `<div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="doctor-editor-backdrop">
+    <div class="bg-white w-full md:max-w-md rounded-t-3xl md:rounded-2xl p-6 shadow-2xl max-h-[90dvh] overflow-y-auto">
+      <div class="flex items-center justify-between mb-4"><h3 class="font-bold text-stone-900 text-lg">${isEdit?'Edit Doctor':'Add Doctor'}</h3><button data-action="close-doctor-editor">${iconHtml('x',18,'text-stone-400')}</button></div>
+      <div class="space-y-3">
+        ${f('name','Name *','e.g. Dr. Sayantani Sarkar')}
+        <div class="grid grid-cols-2 gap-3">${f('specialty','Specialty','e.g. Cardiology')}${f('phone','Phone','e.g. 98xxxxxxxx','tel')}</div>
+        ${f('hospital','Hospital / clinic','e.g. Manipal Hospital')}
+        ${f('notes','Notes','optional')}
+      </div>
+      <div class="flex gap-3 mt-5">
+        ${isEdit?`<button data-action="doctor-delete" data-id="${ed.id}" class="py-3 px-4 border border-rose-200 text-rose-600 rounded-xl text-sm font-bold">${iconHtml('trash-2',15)}</button>`:''}
+        <button data-action="close-doctor-editor" class="flex-1 py-3 border border-stone-200 rounded-xl text-sm font-bold text-stone-500">Cancel</button>
+        <button id="doc-save" class="flex-1 py-3 text-white rounded-xl text-sm font-bold hover:opacity-90" style="background:${C.teal}">${isEdit?'Save':'Add'}</button>
+      </div>
+    </div>
+  </div>`;
 }
 
 // ── Settings page ──
@@ -2350,10 +2657,10 @@ const NAV = [
   { id:'records', label:'Medical Records', icon:'file-text' },
   { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
   { id:'trends', label:'Trends', icon:'trending-up' },
+  { id:'medicines', label:'Medicines', icon:'pill' },
   { id:'spending', label:'Spending', icon:'dollar-sign' },
+  { id:'doctors', label:'Doctors', icon:'stethoscope' },
   { id:'aidoctor', label:'AI Doctor', icon:'brain', badge:'AI' },
-  { id:'healthplan', label:'Health Plan', icon:'target' },
-  { id:'metrics', label:'Metrics', icon:'activity' },
   { id:'family', label:'Family', icon:'user' },
   { id:'settings', label:'Settings', icon:'settings' },
 ];
@@ -2364,9 +2671,9 @@ const MOBILE_MAIN = [
   { id:'spending', label:'Spending', icon:'dollar-sign' },
 ];
 const MOBILE_MORE = [
+  { id:'medicines', label:'Medicines', icon:'pill', desc:'Per-person + reminders' },
+  { id:'doctors', label:'Doctors', icon:'stethoscope', desc:'Directory + phone numbers' },
   { id:'aidoctor', label:'AI Doctor', icon:'brain', desc:'Ask about your records' },
-  { id:'healthplan', label:'Health Plan', icon:'target', desc:'Diet, meds, tests' },
-  { id:'metrics', label:'Metrics', icon:'activity', desc:'BP, weight, steps' },
   { id:'family', label:'Family', icon:'user', desc:'All members' },
   { id:'settings', label:'Settings', icon:'settings', desc:'Account, AI usage' },
 ];
@@ -2452,7 +2759,7 @@ function renderHeader() {
 
 function renderPageContent() {
   // Per-person pages need a selected member. In Whole-Family view, prompt to pick one (Option A).
-  const perPersonPages = ['dashboard', 'healthplan', 'dailylog', 'metrics', 'trends'];
+  const perPersonPages = ['dashboard', 'healthplan', 'dailylog', 'metrics', 'trends', 'medicines'];
   if (state.familyView && perPersonPages.includes(state.page)) {
     return renderPickPerson();
   }
@@ -2461,6 +2768,8 @@ function renderPageContent() {
     case 'records': return renderRecords();
     case 'upcoming': return renderUpcoming();
     case 'trends': return renderTrends();
+    case 'medicines': return renderMedicines();
+    case 'doctors': return renderDoctors();
     case 'healthplan': return renderHealthPlan();
     case 'dailylog': return renderDailyLog();
     case 'spending': return renderSpending();
@@ -2497,6 +2806,9 @@ function renderMainApp() {
     ${state.episodeEditor ? renderEpisodeEditor() : ''}
     ${state.memberEditor ? renderMemberEditor() : ''}
     ${state.followupEditor ? renderFollowupEditor() : ''}
+    ${state.compareModal ? renderCompareModal() : ''}
+    ${state.medicineEditor ? renderMedicineEditor() : ''}
+    ${state.doctorEditor ? renderDoctorEditor() : ''}
   `;
   return `<div class="flex h-screen bg-stone-50 overflow-hidden" id="app-root">
     ${renderSidebar()}
@@ -2552,6 +2864,7 @@ document.addEventListener('click', async (e) => {
   // (clicking the backdrop itself closes; clicks on inner content don't reach here)
   if (e.target.id === 'record-detail-backdrop') { setState({ recordSelectedId: null }); return; }
   if (e.target.id === 'more-sheet-backdrop') { setState({ moreSheetOpen: false }); return; }
+  if (e.target.id === 'compare-backdrop') { setState({ compareModal: null, compareInsight: null }); return; }
 
   const el = e.target.closest('[data-action]');
   if (!el) {
@@ -2701,6 +3014,10 @@ document.addEventListener('click', async (e) => {
     case 'save-upload':
       saveUploadRecord(el.dataset.memberId);
       break;
+    case 'set-upload-mode':
+      setState({ uploadModal: { ...state.uploadModal, uploadMode: el.dataset.mode } });
+      setTimeout(wireUploadModalInputs, 30);
+      break;
     case 'set-upload-target':
       // In manual phase, capture typed fields first so tapping a member chip doesn't wipe them
       if (state.uploadModal?.phase === 'manual') {
@@ -2787,8 +3104,62 @@ document.addEventListener('click', async (e) => {
     case 'save-record-amount':
       await handleSaveRecordAmount(el.dataset.id);
       break;
+    case 'clear-record-amount':
+      await handleClearRecordAmount(el.dataset.id);
+      break;
     case 'spend-filter':
       setState({ spendFilter: el.dataset.id });
+      break;
+    case 'open-compare': {
+      const t = trendByCanon(el.dataset.canon);
+      const pts = t ? t.pts : [];
+      setState({ compareModal: { canon: el.dataset.canon }, compareA: pts[0]?.date || null, compareB: pts[pts.length-1]?.date || null, compareInsight: null, compareLoading: false });
+      break;
+    }
+    case 'close-compare':
+      setState({ compareModal: null, compareInsight: null });
+      break;
+    case 'set-compare-a':
+      setState({ compareA: el.dataset.date, compareInsight: null });
+      break;
+    case 'set-compare-b':
+      setState({ compareB: el.dataset.date, compareInsight: null });
+      break;
+    case 'compare-insight':
+      await handleCompareInsight();
+      break;
+    // ── Medicines ──
+    case 'medicine-add':
+      setState({ medicineEditor: { mid: state.currentId, name:'', dose:'', freq:'', timing:'', purpose:'' } });
+      break;
+    case 'medicine-edit': {
+      const md = state.allMedicines.find(x => x.id === el.dataset.id);
+      if (md) setState({ medicineEditor: { ...md } });
+      break;
+    }
+    case 'close-medicine-editor':
+      setState({ medicineEditor: null });
+      break;
+    case 'medicine-delete':
+      await handleDeleteMedicine(el.dataset.id);
+      break;
+    // ── Doctors ──
+    case 'doctor-add':
+      setState({ doctorEditor: { name:'', specialty:'', hospital:'', phone:'', notes:'' } });
+      break;
+    case 'doctor-add-suggested':
+      setState({ doctorEditor: { name: el.dataset.name, hospital: el.dataset.hospital || '', specialty:'', phone:'', notes:'' } });
+      break;
+    case 'doctor-edit': {
+      const dc = state.allDoctors.find(x => x.id === el.dataset.id);
+      if (dc) setState({ doctorEditor: { ...dc } });
+      break;
+    }
+    case 'close-doctor-editor':
+      setState({ doctorEditor: null });
+      break;
+    case 'doctor-delete':
+      await handleDeleteDoctor(el.dataset.id);
       break;
     case 'cycle-claim':
       await handleCycleClaim(el.dataset.id);
@@ -2849,6 +3220,8 @@ document.addEventListener('click', async (e) => {
   if (e.target.id === 'me-save') handleSaveMember();
   if (e.target.id === 'fu-save') handleSaveFollowup();
   if (e.target.id === 'man-save') handleSaveManual();
+  if (e.target.id === 'med-save') handleSaveMedicine();
+  if (e.target.id === 'doc-save') handleSaveDoctor();
   if (e.target.id === 'dl-save') handleSaveDailyLog();
   if (e.target.id === 'metric-save') handleSaveMetric();
   if (e.target.id === 'ep-save') handleSaveEpisode();
@@ -2904,11 +3277,11 @@ function wireUploadModalInputs() {
   if (dropzone && fileInput) {
     dropzone.onclick = () => fileInput.click();
     dropzone.ondragover = (e) => e.preventDefault();
-    dropzone.ondrop = (e) => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) runUploadAnalysis(f); };
+    dropzone.ondrop = (e) => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) handlePickedFile(f); };
   }
-  if (fileInput) fileInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) runUploadAnalysis(f); };
+  if (fileInput) fileInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) handlePickedFile(f); };
   if (camBtn && camInput) camBtn.onclick = () => camInput.click();
-  if (camInput) camInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) runUploadAnalysis(f); };
+  if (camInput) camInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) handlePickedFile(f); };
   // Manual-phase attach (stores the file WITHOUT triggering AI)
   const manFile = document.getElementById('man-file-input');
   const manCam = document.getElementById('man-camera-input');
@@ -2918,6 +3291,23 @@ function wireUploadModalInputs() {
   if (manFile) manFile.onchange = (e) => { const f = e.target.files?.[0]; if (f) attachManualFile(f); };
   if (manCamBtn && manCam) manCamBtn.onclick = () => manCam.click();
   if (manCam) manCam.onchange = (e) => { const f = e.target.files?.[0]; if (f) attachManualFile(f); };
+}
+
+// A file was picked on the select screen — route by mode: AI reads it, or open the manual form with it attached.
+function handlePickedFile(f) {
+  if (state.uploadModal?.uploadMode === 'manual') {
+    openManualWithFile(f);
+  } else {
+    runUploadAnalysis(f);
+  }
+}
+// Open the manual details form with a file already attached (no AI).
+function openManualWithFile(f) {
+  const um = state.uploadModal || {};
+  const manual = { title: '', type: 'report', date: new Date().toISOString().slice(0,10), amount: '', doctor: '', hospital: '', summary: '' };
+  const target = state.uploadTargetId || state.lastUploadMemberId || state.currentId;
+  setState({ uploadModal: { ...um, phase: 'manual', file: f, manual, uploading: false }, uploadTargetId: target });
+  setTimeout(wireUploadModalInputs, 30);
 }
 
 // Attach (or replace) a file in the manual entry form. Preserves whatever fields are already typed.
@@ -2949,12 +3339,14 @@ async function loadMemberData(memberId) {
 async function loadFamilyData() {
   if (!state.session) return;
   try {
-    const [allRecords, allEpisodes, allFollowups] = await Promise.all([
+    const [allRecords, allEpisodes, allFollowups, allMedicines, allDoctors] = await Promise.all([
       db.getAllRecords(state.session.user.id),
       db.getAllEpisodes(state.session.user.id),
       db.getAllFollowups(state.session.user.id),
+      db.getAllMedicines(state.session.user.id).catch(() => []),
+      db.getAllDoctors(state.session.user.id).catch(() => []),
     ]);
-    setState({ allRecords, allEpisodes, allFollowups });
+    setState({ allRecords, allEpisodes, allFollowups, allMedicines, allDoctors });
   } catch (e) { console.error(e); }
 }
 // Look up a record family-wide (falls back to current-member list)
@@ -3019,6 +3411,16 @@ async function handleSaveRecordAmount(recordId) {
     setState({ editingRecordAmount: null, records: state.records.map(patch) });
     showToast('Amount updated ✓');
   } catch (e) { showToast('Could not update amount — try again'); }
+}
+
+async function handleClearRecordAmount(recordId) {
+  try {
+    await db.updateRecordFields(recordId, { amount: null, claimStatus: 'none' });
+    await loadFamilyData();
+    const patch = r => r.id === recordId ? { ...r, amount: null, claimStatus: 'none' } : r;
+    setState({ editingRecordAmount: null, records: state.records.map(patch) });
+    showToast('Removed from spending');
+  } catch (e) { showToast('Could not update — try again'); }
 }
 
 async function handleCycleClaim(recordId) {
@@ -3158,6 +3560,56 @@ async function handleSaveMember() {
 
 async function reloadMembers() {
   try { state.members = await db.getMembers(state.session.user.id); } catch (e) { console.error(e); }
+}
+
+// ── Medicine handlers ──
+async function handleSaveMedicine() {
+  const ed = state.medicineEditor;
+  const val = k => document.getElementById('med-' + k)?.value?.trim() || '';
+  const name = val('name');
+  if (!name) { showToast('Please enter a medicine name'); return; }
+  const patch = { name, dose: val('dose'), freq: val('freq'), timing: val('timing'), purpose: val('purpose') };
+  try {
+    if (ed.id) await db.updateMedicine(ed.id, patch);
+    else await db.addMedicine(state.session.user.id, { ...patch, mid: ed.mid });
+    await loadFamilyData();
+    setState({ medicineEditor: null });
+    showToast(ed.id ? 'Medicine updated ✓' : 'Medicine added ✓');
+  } catch (e) { showToast('Could not save — try again'); }
+}
+async function handleDeleteMedicine(id) {
+  if (!confirm('Delete this medicine?')) return;
+  try {
+    await db.deleteMedicine(id);
+    await loadFamilyData();
+    setState({ medicineEditor: null });
+    showToast('Medicine deleted');
+  } catch (e) { showToast('Could not delete — try again'); }
+}
+
+// ── Doctor handlers ──
+async function handleSaveDoctor() {
+  const ed = state.doctorEditor;
+  const val = k => document.getElementById('doc-' + k)?.value?.trim() || '';
+  const name = val('name');
+  if (!name) { showToast('Please enter a name'); return; }
+  const patch = { name, specialty: val('specialty'), hospital: val('hospital'), phone: val('phone'), notes: val('notes') };
+  try {
+    if (ed.id) await db.updateDoctor(ed.id, patch);
+    else await db.addDoctor(state.session.user.id, patch);
+    await loadFamilyData();
+    setState({ doctorEditor: null });
+    showToast(ed.id ? 'Doctor updated ✓' : 'Doctor added ✓');
+  } catch (e) { showToast('Could not save — try again'); }
+}
+async function handleDeleteDoctor(id) {
+  if (!confirm('Delete this doctor?')) return;
+  try {
+    await db.deleteDoctor(id);
+    await loadFamilyData();
+    setState({ doctorEditor: null });
+    showToast('Doctor deleted');
+  } catch (e) { showToast('Could not delete — try again'); }
 }
 
 // ── Follow-up handlers (Layer 3) ──

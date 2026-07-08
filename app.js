@@ -69,6 +69,7 @@ let state = {
   compareModal: null,         // { canon } — trend comparison modal
   compareA: null, compareB: null,  // selected reading dates
   compareInsight: null, compareLoading: false,
+  trendTest: null,            // selected test canon for the inline compare panel
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
   episodeEditor: null,        // { id?, mid, title, status, description } when creating/editing a thread
@@ -2160,6 +2161,7 @@ function renderUpcoming() {
           </div>
           ${f.notes?`<p class="text-xs text-stone-500 mt-1 line-clamp-1">${esc(f.notes)}</p>`:''}
           ${f.dateSource==='suggested'?`<p class="text-xs text-amber-600 mt-1">Confirm this with the doctor</p>`:''}
+          ${(() => { const src = f.sourceRecordId ? anyRecord(f.sourceRecordId) : null; return src ? `<button data-action="select-record" data-id="${src.id}" class="inline-flex items-center gap-1 mt-1.5 text-xs font-semibold text-teal-600 hover:underline">${iconHtml('file-text',11)} From: ${esc(src.title)}</button>` : (f.sourceRecordId ? '' : `<p class="text-xs text-stone-300 mt-1.5">Added manually</p>`); })()}
         </div>
       </div>
       <div class="flex gap-2 mt-2.5 pl-12">
@@ -2182,6 +2184,7 @@ function renderUpcoming() {
       }).join('');
 
   return `<div class="fade-in max-w-2xl">
+    ${(() => { const sel = anyRecord(state.recordSelectedId); return sel ? renderRecordDetailModal(sel) : ''; })()}
     <div class="flex items-center justify-between mb-1">
       <h1 class="text-xl md:text-2xl font-bold text-stone-900">What's Coming Up</h1>
       <button data-action="followup-add" class="flex items-center gap-2 px-3 py-2 text-white rounded-xl text-xs font-bold hover:opacity-90" style="background:${C.teal}">${iconHtml('plus',14)} Add</button>
@@ -2315,132 +2318,109 @@ function computeTrends(memberId) {
   return trends;
 }
 
+function computeAllTests(memberId) {
+  const recs = state.allRecords.filter(r => r.mid === memberId && r.date && r.extracted?.keyValues?.length);
+  const buckets = {};
+  recs.forEach(r => {
+    r.extracted.keyValues.forEach(kv => {
+      const num = parseNum(kv.value); if (num == null) return;
+      const canon = canonicalTest(kv.name); if (!canon) return;
+      (buckets[canon] = buckets[canon] || []).push({ date: r.date, value: num, unit: parseUnit(kv.value), status: kv.status, range: parseRange(kv.normal) });
+    });
+  });
+  const out = [];
+  Object.keys(buckets).forEach(canon => {
+    const pts = buckets[canon].sort((a,b) => new Date(a.date) - new Date(b.date));
+    const latest = pts[pts.length-1];
+    const range = pts.map(p => p.range).find(r => r.low != null || r.high != null) || { low:null, high:null };
+    const outOfRange = (range.high != null && latest.value > range.high) || (range.low != null && latest.value < range.low);
+    out.push({ canon, pts, unit: latest.unit, latest, range, outOfRange });
+  });
+  out.sort((a,b) => (b.outOfRange?1:0)-(a.outOfRange?1:0) || b.pts.length - a.pts.length);
+  return out;
+}
+
 function renderTrends() {
   const m = currentMember();
-  const trends = computeTrends(state.currentId);
-  const body = trends.length === 0
-    ? `<div class="text-center py-16 text-stone-400">${iconHtml('trending-up',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No trends yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Upload at least two reports containing the same test (e.g. two LFTs) and ${esc(m.name.split(' ')[0])}'s values will chart here over time.</p></div>`
-    : `<div class="space-y-3">${trends.map((t, i) => {
-        const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`<${t.range.high}`:t.range.low!=null?`>${t.range.low}`:'';
-        return `<div class="bg-white rounded-2xl p-4 border ${t.outOfRange?'border-rose-200':'border-stone-100'} shadow-sm">
-          <div class="flex items-start justify-between mb-2">
-            <div>
-              <p class="font-bold text-stone-900 text-sm">${esc(t.canon)}</p>
-              <p class="text-xs text-stone-400 mt-0.5">${t.pts.length} readings · ${fmtDate(t.pts[0].date)} → ${fmtDate(t.latest.date)}</p>
-            </div>
-            <div class="text-right">
-              <div class="flex items-baseline gap-1.5 justify-end">
-                <span class="text-2xl font-black ${t.outOfRange?'text-rose-600':'text-stone-900'}">${t.latest.value}</span>
-                <span class="text-xs text-stone-400">${esc(t.unit||'')}</span>
-              </div>
-              ${t.outOfRange?badgeHtml('Out of range','bg-rose-50 text-rose-600'):badgeHtml('In range','bg-emerald-50 text-emerald-600')}
-              ${rangeTxt?`<p class="text-xs text-stone-400 mt-1">ref: ${rangeTxt}</p>`:''}
-            </div>
-          </div>
-          <div class="rounded-xl border border-stone-100 overflow-hidden">
-            <table class="w-full text-sm">
-              <tbody>
-                ${t.pts.slice().reverse().map((p, idx, arr) => {
-                  const pOor = (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
-                  const prevVal = idx < arr.length-1 ? arr[idx+1].value : null;
-                  const d = prevVal!=null ? Math.round((p.value-prevVal)*100)/100 : null;
-                  return `<tr class="${idx%2?'bg-stone-50/50':''} border-b border-stone-50 last:border-0">
-                    <td class="px-3 py-2 text-stone-500 text-xs">${fmtDate(p.date)}</td>
-                    <td class="px-3 py-2 text-right font-bold ${pOor?'text-rose-600':'text-stone-800'}">${p.value} <span class="text-xs font-normal text-stone-400">${esc(p.unit||t.unit||'')}</span></td>
-                    <td class="px-3 py-2 text-right text-xs font-semibold ${d==null?'text-stone-300':d>0?'text-rose-400':d<0?'text-teal-500':'text-stone-300'}">${d==null?'—':(d>0?'▲ +':d<0?'▼ ':'')+(d!==0?d:'0')}</td>
-                  </tr>`;
-                }).join('')}
-              </tbody>
-            </table>
-          </div>
-          <div class="flex items-center gap-3 mt-3">
-            <button data-action="open-compare" data-canon="${esc(t.canon)}" class="flex-1 py-2 rounded-lg text-xs font-bold border border-stone-200 text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1">${iconHtml('git-compare',13)} Compare readings</button>
-            <button data-action="open-compare" data-canon="${esc(t.canon)}" class="flex-1 py-2 rounded-lg text-xs font-bold text-white hover:opacity-90 flex items-center justify-center gap-1" style="background:${C.teal}">${iconHtml('sparkles',13)} AI insight</button>
-          </div>
-          ${t.outOfRange?`<div class="mt-2 p-2 bg-amber-50 rounded-lg flex items-start gap-2">${iconHtml('info',13,'text-amber-500 flex-shrink-0 mt-0.5')}<p class="text-xs text-amber-700">Latest reading is outside the reference range — worth asking ${esc(m.name.split(' ')[0])}'s doctor about.</p></div>`:''}
-        </div>`;
-      }).join('')}</div>`;
+  const all = computeAllTests(state.currentId);
+  const comparable = all.filter(t => t.pts.length >= 2);
+
+  if (all.length === 0) {
+    return `<div class="fade-in max-w-2xl">
+      <h1 class="text-xl md:text-2xl font-bold text-stone-900">Trends</h1>
+      <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · lab values over time</p>
+      <div class="text-center py-16 text-stone-400">${iconHtml('trending-up',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No lab values yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Upload ${esc(m.name.split(' ')[0])}'s lab reports and the values will collect here.</p></div>
+    </div>`;
+  }
+
+  // 1) One consolidated table of all latest values
+  const tableHtml = `<div class="bg-white rounded-2xl border border-stone-100 shadow-sm overflow-hidden mb-5">
+    <table class="w-full text-sm">
+      <thead><tr class="text-xs text-stone-400 border-b border-stone-100"><th class="text-left font-bold px-3 py-2">Test</th><th class="text-right font-bold px-3 py-2">Latest</th><th class="text-right font-bold px-3 py-2">Ref range</th><th class="text-right font-bold px-3 py-2 pr-4">${''}</th></tr></thead>
+      <tbody>
+        ${all.map((t, idx) => {
+          const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`< ${t.range.high}`:t.range.low!=null?`> ${t.range.low}`:'—';
+          return `<tr class="${idx%2?'bg-stone-50/40':''} border-b border-stone-50 last:border-0">
+            <td class="px-3 py-2.5 font-semibold text-stone-800">${esc(t.canon)}<span class="block text-xs font-normal text-stone-400">${fmtDate(t.latest.date)} · ${t.pts.length} reading${t.pts.length!==1?'s':''}</span></td>
+            <td class="px-3 py-2.5 text-right font-black ${t.outOfRange?'text-rose-600':'text-stone-900'}">${t.latest.value}<span class="text-xs font-normal text-stone-400 ml-0.5">${esc(t.unit||'')}</span></td>
+            <td class="px-3 py-2.5 text-right text-xs text-stone-400">${rangeTxt}</td>
+            <td class="px-3 py-2.5 text-right pr-4">${t.outOfRange?`<span class="text-xs font-bold text-rose-500">●</span>`:`<span class="text-xs font-bold text-emerald-500">●</span>`}</td>
+          </tr>`;
+        }).join('')}
+      </tbody>
+    </table>
+  </div>`;
+
+  // 2) Guided compare panel: test → date1 → date2 → AI
+  let compareHtml = '';
+  if (comparable.length === 0) {
+    compareHtml = `<div class="bg-stone-50 rounded-2xl p-4 text-center text-xs text-stone-400">Upload a second reading of any test to compare readings over time.</div>`;
+  } else {
+    const selCanon = state.trendTest && comparable.some(t=>t.canon===state.trendTest) ? state.trendTest : comparable[0].canon;
+    const t = comparable.find(x => x.canon === selCanon);
+    const pts = t.pts;
+    const aDate = state.compareA && pts.some(p=>p.date===state.compareA) ? state.compareA : pts[0].date;
+    const bDate = state.compareB && pts.some(p=>p.date===state.compareB) ? state.compareB : pts[pts.length-1].date;
+    const A = pts.find(p => p.date === aDate), B = pts.find(p => p.date === bDate);
+    const oor = (p) => (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
+    const delta = Math.round((B.value - A.value) * 100) / 100;
+    const pct = A.value ? Math.round((B.value - A.value) / A.value * 100) : null;
+    const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`< ${t.range.high}`:t.range.low!=null?`> ${t.range.low}`:'not specified';
+    const col = (p, label, showDelta) => `<div class="flex-1 p-3 rounded-xl ${oor(p)?'bg-rose-50 border border-rose-100':'bg-white border border-stone-100'}">
+      <p class="text-xs font-bold text-stone-400 uppercase tracking-wide">${label}</p>
+      <p class="text-xs text-stone-400 mt-0.5">${fmtDate(p.date)}</p>
+      <p class="text-2xl font-black mt-1 ${oor(p)?'text-rose-600':'text-stone-900'}">${p.value}<span class="text-xs font-bold text-stone-400 ml-1">${esc(p.unit||t.unit||'')}</span></p>
+      ${showDelta&&delta!==0?`<p class="text-xs font-black mt-1 ${delta>0?'text-rose-500':'text-teal-600'}">${delta>0?'▲ +':'▼ '}${delta}${pct!=null?` (${pct>0?'+':''}${pct}%)`:''}</p>`:''}
+    </div>`;
+    const dateChips = (which, sel) => pts.map(p => `<button data-action="set-compare-${which}" data-date="${p.date}" class="px-2.5 py-1 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${sel===p.date?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${sel===p.date?`background:${C.teal}`:''}">${fmtDate(p.date)}</button>`).join('');
+
+    compareHtml = `<div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
+      <p class="text-sm font-bold text-stone-800 mb-3">Compare two readings</p>
+      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Test</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${comparable.map(x=>`<button data-action="trend-set-test" data-canon="${esc(x.canon)}" class="px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${selCanon===x.canon?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${selCanon===x.canon?`background:${C.teal}`:''}">${esc(x.canon)}</button>`).join('')}</div></div>
+      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Earlier date</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${dateChips('a', aDate)}</div></div>
+      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Later date</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${dateChips('b', bDate)}</div></div>
+      <div class="flex items-stretch gap-2 mb-2">${col(A,'Earlier',false)}<div class="flex items-center">${iconHtml('arrow-right',16,'text-stone-300')}</div>${col(B,'Later',true)}</div>
+      <p class="text-xs text-stone-400 mb-3">Reference range: ${rangeTxt} ${esc(t.unit||'')}</p>
+      ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-xl mb-3"><div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI interpretation</p></div><p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p><p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p></div>`:''}
+      <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-2.5 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Thinking…':(state.compareInsight?'Re-interpret':'Ask AI to interpret this change')}</button>
+    </div>`;
+  }
 
   return `<div class="fade-in max-w-2xl">
     <h1 class="text-xl md:text-2xl font-bold text-stone-900">Trends</h1>
-    <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · how lab values move over time</p>
-    ${body}
+    <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · ${all.length} test${all.length!==1?'s':''} tracked</p>
+    ${tableHtml}
+    ${compareHtml}
   </div>`;
 }
 
 function mountTrendsCharts() { /* Trends is now a table — no charts */ }
 
-// ── Trend comparison (pick two readings + AI insight) ──
-function trendByCanon(canon) {
-  return computeTrends(state.currentId).find(t => t.canon === canon);
-}
-function renderCompareModal() {
-  const cm = state.compareModal;
-  if (!cm) return '';
-  const t = trendByCanon(cm.canon);
-  if (!t) return '';
-  const m = currentMember();
-  const pts = t.pts;
-  const aDate = state.compareA || pts[0].date;
-  const bDate = state.compareB || pts[pts.length-1].date;
-  const A = pts.find(p => p.date === aDate) || pts[0];
-  const B = pts.find(p => p.date === bDate) || pts[pts.length-1];
-  const oor = (p) => (t.range.high!=null&&p.value>t.range.high)||(t.range.low!=null&&p.value<t.range.low);
-  const delta = Math.round((B.value - A.value) * 100) / 100;
-  const pct = A.value ? Math.round((B.value - A.value) / A.value * 100) : null;
-  const dir = delta > 0 ? 'up' : delta < 0 ? 'down' : 'flat';
-  const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`< ${t.range.high}`:t.range.low!=null?`> ${t.range.low}`:'not specified';
-
-  const readingCol = (p, label, showDelta) => `
-    <div class="flex-1 p-3 rounded-2xl ${oor(p)?'bg-rose-50 border border-rose-100':'bg-stone-50 border border-stone-100'}">
-      <p class="text-xs font-bold text-stone-400 uppercase tracking-wide">${label}</p>
-      <p class="text-xs text-stone-400 mt-0.5">${fmtDate(p.date)}</p>
-      <p class="text-3xl font-black mt-1 ${oor(p)?'text-rose-600':'text-stone-900'}">${p.value}<span class="text-sm font-bold text-stone-400 ml-1">${esc(p.unit||t.unit||'')}</span></p>
-      ${oor(p)?`<p class="text-xs font-bold text-rose-600 mt-1">Out of range</p>`:`<p class="text-xs font-bold text-emerald-600 mt-1">In range</p>`}
-      ${showDelta&&delta!==0?`<div class="mt-2 pt-2 border-t border-stone-200/60 flex items-center gap-1 text-sm font-black ${dir==='up'?'text-rose-500':'text-teal-600'}">${iconHtml(dir==='up'?'trending-up':'trending-down',14)} ${delta>0?'+':''}${delta}${pct!=null?` (${pct>0?'+':''}${pct}%)`:''}</div>`:''}
-    </div>`;
-
-  const chip = (p, which) => {
-    const sel = which==='a' ? aDate===p.date : bDate===p.date;
-    return `<button data-action="set-compare-${which}" data-date="${p.date}" class="px-2.5 py-1 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${sel?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${sel?`background:${C.teal}`:''}">${fmtDate(p.date)}</button>`;
-  };
-
-  return `
-  <div class="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-end md:items-center justify-center" id="compare-backdrop">
-    <div class="bg-white w-full md:max-w-lg rounded-t-3xl md:rounded-2xl p-5 shadow-2xl max-h-[92dvh] overflow-y-auto">
-      <div class="flex items-center justify-between mb-1">
-        <h3 class="font-bold text-stone-900 text-lg">${esc(t.canon)}</h3>
-        <button data-action="close-compare">${iconHtml('x',18,'text-stone-400')}</button>
-      </div>
-      <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · reference range ${rangeTxt}</p>
-
-      <div class="flex gap-3 mb-3">
-        ${readingCol(A, 'Earlier', false)}
-        <div class="flex items-center">${iconHtml('arrow-right',18,'text-stone-300')}</div>
-        ${readingCol(B, 'Later', true)}
-      </div>
-
-      <div class="space-y-2 mb-4">
-        <div><p class="text-xs font-bold text-stone-400 mb-1">Earlier reading</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${pts.map(p=>chip(p,'a')).join('')}</div></div>
-        <div><p class="text-xs font-bold text-stone-400 mb-1">Later reading</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${pts.map(p=>chip(p,'b')).join('')}</div></div>
-      </div>
-
-      ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-2xl mb-3">
-        <div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI interpretation</p></div>
-        <p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p>
-        <p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p>
-      </div>` : ''}
-
-      <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-3 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">
-        ${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Thinking…':(state.compareInsight?'Re-interpret this change':'Ask AI to interpret this change')}
-      </button>
-    </div>
-  </div>`;
-}
-
 async function handleCompareInsight() {
-  const cm = state.compareModal; if (!cm) return;
-  const t = trendByCanon(cm.canon); if (!t) return;
+  const all = computeAllTests(state.currentId).filter(t => t.pts.length >= 2);
+  if (all.length === 0) return;
+  const canon = state.trendTest && all.some(t=>t.canon===state.trendTest) ? state.trendTest : all[0].canon;
+  const t = all.find(x => x.canon === canon); if (!t) return;
   const m = currentMember();
   const pts = t.pts;
   const A = pts.find(p => p.date === (state.compareA || pts[0].date)) || pts[0];
@@ -2803,7 +2783,6 @@ function renderMainApp() {
     ${state.episodeEditor ? renderEpisodeEditor() : ''}
     ${state.memberEditor ? renderMemberEditor() : ''}
     ${state.followupEditor ? renderFollowupEditor() : ''}
-    ${state.compareModal ? renderCompareModal() : ''}
     ${state.medicineEditor ? renderMedicineEditor() : ''}
     ${state.doctorEditor ? renderDoctorEditor() : ''}
   `;
@@ -3107,15 +3086,12 @@ document.addEventListener('click', async (e) => {
     case 'spend-filter':
       setState({ spendFilter: el.dataset.id });
       break;
-    case 'open-compare': {
-      const t = trendByCanon(el.dataset.canon);
+    case 'trend-set-test': {
+      const t = computeAllTests(state.currentId).find(x => x.canon === el.dataset.canon);
       const pts = t ? t.pts : [];
-      setState({ compareModal: { canon: el.dataset.canon }, compareA: pts[0]?.date || null, compareB: pts[pts.length-1]?.date || null, compareInsight: null, compareLoading: false });
+      setState({ trendTest: el.dataset.canon, compareA: pts[0]?.date || null, compareB: pts[pts.length-1]?.date || null, compareInsight: null });
       break;
     }
-    case 'close-compare':
-      setState({ compareModal: null, compareInsight: null });
-      break;
     case 'set-compare-a':
       setState({ compareA: el.dataset.date, compareInsight: null });
       break;

@@ -70,6 +70,7 @@ let state = {
   compareA: null, compareB: null,  // selected reading dates
   compareInsight: null, compareLoading: false,
   compareRepA: null, compareRepB: null,  // selected report ids for report-vs-report compare
+  compareRun: false,          // whether to show the comparison result
   trendTest: null,            // selected test canon for the inline compare panel
   openEpisodeId: null,        // when viewing a single episode's detail
   fileModal: null,            // { recordId, proposedEpisodeId, proposedNewTitle, mode } for inline filing
@@ -2365,81 +2366,75 @@ function reportsWithLabs(memberId) {
 
 function renderTrends() {
   const m = currentMember();
-  const all = computeAllTests(state.currentId);
+  const reports = reportsWithLabs(state.currentId);
 
-  if (all.length === 0) {
+  if (reports.length === 0) {
     return `<div class="fade-in max-w-2xl">
-      <h1 class="text-xl md:text-2xl font-bold text-stone-900">Trends</h1>
-      <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · lab values over time</p>
-      <div class="text-center py-16 text-stone-400">${iconHtml('trending-up',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No lab values yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Upload ${esc(m.name.split(' ')[0])}'s lab reports and the values will collect here.</p></div>
+      <h1 class="text-xl md:text-2xl font-bold text-stone-900">Compare Reports</h1>
+      <p class="text-xs text-stone-400 mb-4">${esc(m.name)}</p>
+      <div class="text-center py-16 text-stone-400">${iconHtml('git-compare',36,'mx-auto mb-3 opacity-30')}<p class="font-semibold">No lab reports yet</p><p class="text-sm mt-1 max-w-xs mx-auto">Upload ${esc(m.name.split(' ')[0])}'s lab reports and you'll be able to compare any two side by side.</p></div>
     </div>`;
   }
 
-  // 1) One consolidated table of all latest values
-  const tableHtml = `<div class="bg-white rounded-2xl border border-stone-100 shadow-sm overflow-hidden mb-5">
-    <table class="w-full text-sm">
-      <thead><tr class="text-xs text-stone-400 border-b border-stone-100"><th class="text-left font-bold px-3 py-2">Test</th><th class="text-right font-bold px-3 py-2">Latest</th><th class="text-right font-bold px-3 py-2">Ref range</th><th class="text-right font-bold px-3 py-2 pr-4">${''}</th></tr></thead>
-      <tbody>
-        ${all.map((t, idx) => {
-          const rangeTxt = t.range.low!=null&&t.range.high!=null?`${t.range.low}–${t.range.high}`:t.range.high!=null?`< ${t.range.high}`:t.range.low!=null?`> ${t.range.low}`:'—';
-          return `<tr class="${idx%2?'bg-stone-50/40':''} border-b border-stone-50 last:border-0">
-            <td class="px-3 py-2.5 font-semibold text-stone-800">${esc(t.canon)}<span class="block text-xs font-normal text-stone-400">${fmtDate(t.latest.date)} · ${t.pts.length} reading${t.pts.length!==1?'s':''}</span></td>
-            <td class="px-3 py-2.5 text-right font-black ${t.outOfRange?'text-rose-600':'text-stone-900'}">${t.latest.value}<span class="text-xs font-normal text-stone-400 ml-0.5">${esc(t.unit||'')}</span></td>
-            <td class="px-3 py-2.5 text-right text-xs text-stone-400">${rangeTxt}</td>
-            <td class="px-3 py-2.5 text-right pr-4">${t.outOfRange?`<span class="text-xs font-bold text-rose-500">●</span>`:`<span class="text-xs font-bold text-emerald-500">●</span>`}</td>
-          </tr>`;
-        }).join('')}
-      </tbody>
-    </table>
-  </div>`;
+  const label = r => `${esc(r.title)} · ${fmtDate(r.date)}`;
+  const RA = state.compareRepA ? reports.find(r => r.id === state.compareRepA) : null;
+  // Filter 2 offers only reports of the SAME kind as A (sharing ≥2 parameters) — LFT vs LFT, not LFT vs lipid
+  const compatible = RA ? reports.filter(r => r.id !== RA.id && Object.keys(r.vals).filter(k => RA.vals[k]).length >= 2) : reports;
+  const RB = state.compareRepB ? reports.find(r => r.id === state.compareRepB) : null;
 
-  // 2) Report-vs-report comparison: pick two reports, see all parameters side by side + whole-report AI
-  const reports = reportsWithLabs(state.currentId);
-  let compareHtml = '';
-  if (reports.length < 2) {
-    compareHtml = `<div class="bg-stone-50 rounded-2xl p-4 text-center text-xs text-stone-400">Upload a second lab report to compare two reports side by side.</div>`;
-  } else {
-    const bId = state.compareRepB && reports.some(r=>r.id===state.compareRepB) ? state.compareRepB : reports[0].id;
-    const aId = state.compareRepA && reports.some(r=>r.id===state.compareRepA) ? state.compareRepA : reports[1].id;
-    const RA = reports.find(r => r.id === aId), RB = reports.find(r => r.id === bId);
-    // union of parameters across both reports
-    const params = [...new Set([...Object.keys(RA.vals), ...Object.keys(RB.vals)])];
-    const reportChip = (r, which, selId) => `<button data-action="set-report-${which}" data-id="${r.id}" class="px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap flex-shrink-0 ${selId===r.id?'text-white':'bg-white text-stone-500 border border-stone-200'}" style="${selId===r.id?`background:${C.teal}`:''}">${fmtDate(r.date)}</button>`;
-    const rowsHtml = params.map(p => {
-      const a = RA.vals[p], b = RB.vals[p];
-      const range = (a&&(a.range.low!=null||a.range.high!=null))?a.range:(b?b.range:{low:null,high:null});
-      const oor = v => v!=null && ((range.high!=null&&v>range.high)||(range.low!=null&&v<range.low));
-      const delta = (a&&b)?Math.round((b.value-a.value)*100)/100:null;
-      const rangeTxt = range.low!=null&&range.high!=null?`${range.low}–${range.high}`:range.high!=null?`< ${range.high}`:range.low!=null?`> ${range.low}`:'';
-      return `<tr class="border-b border-stone-50 last:border-0">
-        <td class="px-3 py-2 font-semibold text-stone-700 text-xs">${esc(p)}${rangeTxt?`<span class="block text-stone-400 font-normal">${rangeTxt}</span>`:''}</td>
-        <td class="px-2 py-2 text-right font-bold ${oor(a?.value)?'text-rose-600':'text-stone-800'}">${a?a.value:'—'}</td>
-        <td class="px-2 py-2 text-right font-bold ${oor(b?.value)?'text-rose-600':'text-stone-800'}">${b?b.value:'—'}</td>
-        <td class="px-3 py-2 text-right text-xs font-semibold ${delta==null?'text-stone-300':delta>0?'text-rose-400':delta<0?'text-teal-500':'text-stone-300'}">${delta==null?'—':(delta>0?'▲+':delta<0?'▼':'')+(delta!==0?delta:'0')}</td>
-      </tr>`;
-    }).join('');
+  const optionsA = [`<option value="">None</option>`, ...reports.map(r => `<option value="${r.id}" ${state.compareRepA===r.id?'selected':''}>${label(r)}</option>`)].join('');
+  const optionsB = [`<option value="">None</option>`, ...compatible.map(r => `<option value="${r.id}" ${state.compareRepB===r.id?'selected':''}>${label(r)}</option>`)].join('');
 
-    compareHtml = `<div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
-      <p class="text-sm font-bold text-stone-800 mb-1">Compare two reports</p>
-      <p class="text-xs text-stone-400 mb-3">Pick two dates — all shared values line up side by side.</p>
-      <div class="mb-2"><p class="text-xs font-bold text-stone-400 mb-1.5">Earlier report</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${reports.map(r=>reportChip(r,'a',aId)).join('')}</div></div>
-      <div class="mb-3"><p class="text-xs font-bold text-stone-400 mb-1.5">Later report</p><div class="flex gap-1.5 overflow-x-auto pb-1 hide-scrollbar">${reports.map(r=>reportChip(r,'b',bId)).join('')}</div></div>
-      <div class="rounded-xl border border-stone-100 overflow-hidden mb-3">
-        <table class="w-full text-sm">
-          <thead><tr class="text-xs text-stone-400 border-b border-stone-100 bg-stone-50/50"><th class="text-left font-bold px-3 py-2">Parameter</th><th class="text-right font-bold px-2 py-2">${fmtDate(RA.date)}</th><th class="text-right font-bold px-2 py-2">${fmtDate(RB.date)}</th><th class="text-right font-bold px-3 py-2">Δ</th></tr></thead>
-          <tbody>${rowsHtml}</tbody>
-        </table>
-      </div>
-      ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-xl mb-3"><div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI reading of these reports</p></div><p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p><p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p></div>`:''}
-      <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-2.5 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Reading the reports…':(state.compareInsight?'Re-interpret':'Ask AI to read these reports')}</button>
-    </div>`;
+  // Build the comparison table only after Run, and only when both are chosen
+  let resultHtml = '';
+  const ready = RA && RB;
+  if (state.compareRun && ready) {
+    const shared = Object.keys(RA.vals).filter(k => RB.vals[k]);
+    const params = shared.length ? shared : [...new Set([...Object.keys(RA.vals), ...Object.keys(RB.vals)])];
+    if (!shared.length) {
+      resultHtml = `<div class="bg-amber-50 border border-amber-100 rounded-xl p-3 text-xs text-amber-700 mt-3">${iconHtml('info',13,'inline mr-1')}These two reports don't share any common tests — pick two of the same kind (e.g. two LFTs) to compare like-for-like.</div>`;
+    } else {
+      const rowsHtml = params.map(p => {
+        const a = RA.vals[p], b = RB.vals[p];
+        const range = (a&&(a.range.low!=null||a.range.high!=null))?a.range:(b?b.range:{low:null,high:null});
+        const oor = v => v!=null && ((range.high!=null&&v>range.high)||(range.low!=null&&v<range.low));
+        const delta = (a&&b)?Math.round((b.value-a.value)*100)/100:null;
+        const rangeTxt = range.low!=null&&range.high!=null?`${range.low}–${range.high}`:range.high!=null?`< ${range.high}`:range.low!=null?`> ${range.low}`:'';
+        return `<tr class="border-b border-stone-50 last:border-0">
+          <td class="px-3 py-2 font-semibold text-stone-700 text-xs">${esc(p)}${rangeTxt?`<span class="block text-stone-400 font-normal">${rangeTxt}</span>`:''}</td>
+          <td class="px-2 py-2 text-right font-bold ${oor(a?.value)?'text-rose-600':'text-stone-800'}">${a?a.value:'—'}</td>
+          <td class="px-2 py-2 text-right font-bold ${oor(b?.value)?'text-rose-600':'text-stone-800'}">${b?b.value:'—'}</td>
+          <td class="px-3 py-2 text-right text-xs font-semibold ${delta==null?'text-stone-300':delta>0?'text-rose-400':delta<0?'text-teal-500':'text-stone-300'}">${delta==null?'—':(delta>0?'▲+':delta<0?'▼':'')+(delta!==0?delta:'0')}</td>
+        </tr>`;
+      }).join('');
+      resultHtml = `
+        <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-2.5 mt-4 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Reading the reports…':(state.compareInsight?'Re-read with AI':'Ask AI to summarise these reports')}</button>
+        ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-xl mt-3"><div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI summary</p></div><p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p><p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p></div>` : ''}
+        <div class="rounded-xl border border-stone-100 overflow-hidden mt-3">
+          <table class="w-full text-sm">
+            <thead><tr class="text-xs text-stone-400 border-b border-stone-100 bg-stone-50/50"><th class="text-left font-bold px-3 py-2">Parameter</th><th class="text-right font-bold px-2 py-2">${fmtDate(RA.date)}</th><th class="text-right font-bold px-2 py-2">${fmtDate(RB.date)}</th><th class="text-right font-bold px-3 py-2">Δ</th></tr></thead>
+            <tbody>${rowsHtml}</tbody>
+          </table>
+        </div>`;
+    }
   }
 
   return `<div class="fade-in max-w-2xl">
-    <h1 class="text-xl md:text-2xl font-bold text-stone-900">Trends</h1>
-    <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · ${all.length} test${all.length!==1?'s':''} tracked</p>
-    ${tableHtml}
-    ${compareHtml}
+    <h1 class="text-xl md:text-2xl font-bold text-stone-900">Compare Reports</h1>
+    <p class="text-xs text-stone-400 mb-4">${esc(m.name)} · pick two reports of the same kind to compare</p>
+    <div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
+      <div class="mb-3">
+        <label class="block text-xs font-bold text-stone-500 mb-1">First report</label>
+        <select id="cmp-a" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-teal-600">${optionsA}</select>
+      </div>
+      <div class="mb-3">
+        <label class="block text-xs font-bold text-stone-500 mb-1">Second report ${RA?'<span class="font-normal text-stone-400">(same kind as first)</span>':''}</label>
+        <select id="cmp-b" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-teal-600" ${!RA?'disabled':''}>${optionsB}</select>
+        ${RA&&compatible.length===0?`<p class="text-xs text-amber-600 mt-1">No other report of the same kind yet — upload another ${esc(RA.title.split(' ')[0])} to compare.</p>`:''}
+      </div>
+      <button data-action="run-compare" ${!ready?'disabled':''} class="w-full py-2.5 rounded-xl text-sm font-bold border-2 disabled:opacity-50 ${ready?'text-white hover:opacity-90':'text-stone-400 border-stone-200'}" style="${ready?`background:${C.teal};border-color:${C.teal}`:''}">${iconHtml('git-compare',15,'inline mr-1')} Run comparison</button>
+      ${resultHtml}
+    </div>
   </div>`;
 }
 
@@ -2762,7 +2757,7 @@ function renderHeader() {
       ${memberMenuHtml}
     </div>
     <div class="flex items-center gap-1">
-      <button class="relative p-2.5 rounded-xl hover:bg-stone-50">${iconHtml('bell',18,'text-stone-400')}<span class="absolute top-2 right-2 w-2 h-2 bg-rose-500 rounded-full"></span></button>
+      <button data-action="goto" data-page="upcoming" class="relative p-2.5 rounded-xl hover:bg-stone-50" title="What's coming up">${iconHtml('bell',18,'text-stone-400')}${(() => { const due = (state.allFollowups||[]).filter(f => f.status==='pending' && ['overdue','week'].includes(fuBucket(f.dueDate))).length; return due ? `<span class="absolute top-1.5 right-1.5 min-w-4 h-4 px-1 bg-rose-500 rounded-full text-white text-[10px] font-black flex items-center justify-center">${due>9?'9+':due}</span>` : ''; })()}</button>
       <button data-action="goto" data-page="settings" class="p-2.5 rounded-xl hover:bg-stone-50 hidden md:flex">${iconHtml('settings',18,'text-stone-400')}</button>
       <button data-action="goto" data-page="settings" class="w-8 h-8 rounded-full flex items-center justify-center text-white text-sm font-black ml-1" style="background:${C.teal}">${esc((state.session?.user?.email?.[0]||'S').toUpperCase())}</button>
     </div>
@@ -2870,6 +2865,13 @@ function mountChartsForCurrentPage() {
 // ─────────────────────────────────────────
 //  EVENT DELEGATION  (single listener handles all clicks)
 // ─────────────────────────────────────────
+document.addEventListener('change', (e) => {
+  if (e.target.id === 'cmp-a') {
+    setState({ compareRepA: e.target.value || null, compareRepB: null, compareRun: false, compareInsight: null });
+  } else if (e.target.id === 'cmp-b') {
+    setState({ compareRepB: e.target.value || null, compareRun: false, compareInsight: null });
+  }
+});
 document.addEventListener('click', async (e) => {
   // Outside-click-to-close for modals that use the backdrop-id pattern
   // (clicking the backdrop itself closes; clicks on inner content don't reach here)
@@ -3121,11 +3123,8 @@ document.addEventListener('click', async (e) => {
     case 'spend-filter':
       setState({ spendFilter: el.dataset.id });
       break;
-    case 'set-report-a':
-      setState({ compareRepA: el.dataset.id, compareInsight: null });
-      break;
-    case 'set-report-b':
-      setState({ compareRepB: el.dataset.id, compareInsight: null });
+    case 'run-compare':
+      setState({ compareRun: true, compareInsight: null });
       break;
     case 'compare-insight':
       await handleCompareInsight();

@@ -2400,21 +2400,31 @@ function renderTrends() {
         const oor = v => v!=null && ((range.high!=null&&v>range.high)||(range.low!=null&&v<range.low));
         const delta = (a&&b)?Math.round((b.value-a.value)*100)/100:null;
         const rangeTxt = range.low!=null&&range.high!=null?`${range.low}–${range.high}`:range.high!=null?`< ${range.high}`:range.low!=null?`> ${range.low}`:'';
-        return `<tr class="border-b border-stone-50 last:border-0">
-          <td class="px-3 py-2 font-semibold text-stone-700 text-xs">${esc(p)}${rangeTxt?`<span class="block text-stone-400 font-normal">${rangeTxt}</span>`:''}</td>
-          <td class="px-2 py-2 text-right font-bold ${oor(a?.value)?'text-rose-600':'text-stone-800'}">${a?a.value:'—'}</td>
-          <td class="px-2 py-2 text-right font-bold ${oor(b?.value)?'text-rose-600':'text-stone-800'}">${b?b.value:'—'}</td>
-          <td class="px-3 py-2 text-right text-xs font-semibold ${delta==null?'text-stone-300':delta>0?'text-rose-400':delta<0?'text-teal-500':'text-stone-300'}">${delta==null?'—':(delta>0?'▲+':delta<0?'▼':'')+(delta!==0?delta:'0')}</td>
+        return `<tr class="border-b border-stone-50 last:border-0 align-top">
+          <td class="px-3 py-2.5 font-semibold text-stone-700 text-xs">${esc(p)}${rangeTxt?`<span class="block text-stone-400 font-normal">${rangeTxt}</span>`:''}</td>
+          <td class="px-2 py-2.5 text-right font-bold ${oor(a?.value)?'text-rose-600':'text-stone-800'}">${a?a.value:'—'}</td>
+          <td class="px-3 py-2.5 text-right">
+            <span class="font-bold ${oor(b?.value)?'text-rose-600':'text-stone-800'}">${b?b.value:'—'}</span>
+            ${delta!=null&&delta!==0?`<span class="block text-xs font-bold ${delta>0?'text-rose-400':'text-teal-500'}">${delta>0?'▲ +':'▼ '}${delta}</span>`:''}
+          </td>
         </tr>`;
       }).join('');
       resultHtml = `
         <button data-action="compare-insight" ${state.compareLoading?'disabled':''} class="w-full py-2.5 mt-4 text-white rounded-xl text-sm font-bold flex items-center justify-center gap-2 hover:opacity-90 disabled:opacity-60" style="background:${C.teal}">${state.compareLoading?spinnerHtml(15,'text-white'):iconHtml('sparkles',15)} ${state.compareLoading?'Reading the reports…':(state.compareInsight?'Re-read with AI':'Ask AI to summarise these reports')}</button>
         ${state.compareInsight ? `<div class="p-3 bg-teal-50 border border-teal-100 rounded-xl mt-3"><div class="flex items-center gap-1.5 mb-1.5">${iconHtml('sparkles',14,'text-teal-600')}<p class="text-xs font-bold text-teal-700">AI summary</p></div><p class="text-sm text-teal-900 whitespace-pre-line">${esc(state.compareInsight)}</p><p class="text-xs text-teal-600 mt-2">General information — confirm with ${esc(m.name.split(' ')[0])}'s doctor.</p></div>` : ''}
         <div class="rounded-xl border border-stone-100 overflow-hidden mt-3">
-          <table class="w-full text-sm">
-            <thead><tr class="text-xs text-stone-400 border-b border-stone-100 bg-stone-50/50"><th class="text-left font-bold px-3 py-2">Parameter</th><th class="text-right font-bold px-2 py-2">${fmtDate(RA.date)}</th><th class="text-right font-bold px-2 py-2">${fmtDate(RB.date)}</th><th class="text-right font-bold px-3 py-2">Δ</th></tr></thead>
+          <table class="w-full text-sm table-fixed">
+            <thead><tr class="text-xs text-stone-400 border-b border-stone-100 bg-stone-50/50">
+              <th class="text-left font-bold px-3 py-2 w-[44%]">Parameter</th>
+              <th class="text-right font-bold px-2 py-2">${fmtDate(RA.date)}</th>
+              <th class="text-right font-bold px-3 py-2">${fmtDate(RB.date)}</th>
+            </tr></thead>
             <tbody>${rowsHtml}</tbody>
           </table>
+        </div>
+        <div class="flex gap-2 mt-3">
+          <button data-action="share-comparison" class="flex-1 py-2.5 rounded-xl text-sm font-bold border border-stone-200 text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1.5">${iconHtml('share-2',14)} Share</button>
+          <button data-action="print-comparison" class="flex-1 py-2.5 rounded-xl text-sm font-bold border border-stone-200 text-stone-600 hover:bg-stone-50 flex items-center justify-center gap-1.5">${iconHtml('printer',14)} Print / PDF</button>
         </div>`;
     }
   }
@@ -2439,6 +2449,80 @@ function renderTrends() {
 }
 
 function mountTrendsCharts() { /* Trends is now a table — no charts */ }
+
+// Gather the currently-selected comparison (or null) for share/print
+function currentComparison() {
+  const reports = reportsWithLabs(state.currentId);
+  if (reports.length < 2) return null;
+  const RA = state.compareRepA ? reports.find(r => r.id === state.compareRepA) : null;
+  const RB = state.compareRepB ? reports.find(r => r.id === state.compareRepB) : null;
+  if (!RA || !RB) return null;
+  const shared = Object.keys(RA.vals).filter(k => RB.vals[k]);
+  const params = shared.length ? shared : [...new Set([...Object.keys(RA.vals), ...Object.keys(RB.vals)])];
+  const rows = params.map(p => {
+    const a = RA.vals[p], b = RB.vals[p];
+    const range = (a&&(a.range.low!=null||a.range.high!=null))?a.range:(b?b.range:{low:null,high:null});
+    const rangeTxt = range.low!=null&&range.high!=null?`${range.low}-${range.high}`:range.high!=null?`<${range.high}`:range.low!=null?`>${range.low}`:'';
+    const oor = v => v!=null && ((range.high!=null&&v>range.high)||(range.low!=null&&v<range.low));
+    return { p, a: a?a.value:null, b: b?b.value:null, unit: a?.unit||b?.unit||'', rangeTxt, aOor: oor(a?.value), bOor: oor(b?.value) };
+  });
+  return { m: currentMember(), RA, RB, rows, insight: state.compareInsight };
+}
+
+function comparisonPlainText() {
+  const c = currentComparison(); if (!c) return '';
+  const pad = (s, n) => (String(s) + ' '.repeat(n)).slice(0, n);
+  let t = `LFT comparison — ${c.m.name}\n`;
+  t += `${fmtDate(c.RA.date)}  vs  ${fmtDate(c.RB.date)}\n\n`;
+  t += `${pad('Parameter',18)} ${pad(fmtDate(c.RA.date),9)} ${pad(fmtDate(c.RB.date),9)} ref\n`;
+  c.rows.forEach(r => {
+    const flag = r.bOor ? ' *' : '';
+    t += `${pad(r.p,18)} ${pad(r.a??'-',9)} ${pad((r.b??'-')+flag,9)} ${r.rangeTxt}\n`;
+  });
+  if (c.insight) t += `\nAI summary:\n${c.insight}\n`;
+  t += `\n(* = outside reference range · general info, confirm with the doctor)\n— via HealthHub`;
+  return t;
+}
+
+async function handleShareComparison() {
+  const text = comparisonPlainText();
+  if (!text) { showToast('Run a comparison first'); return; }
+  try {
+    if (navigator.share) { await navigator.share({ title: 'Lab comparison', text }); }
+    else { await navigator.clipboard.writeText(text); showToast('Copied to clipboard ✓'); }
+  } catch (e) { /* user cancelled share — ignore */ }
+}
+
+function handlePrintComparison() {
+  const c = currentComparison();
+  if (!c) { showToast('Run a comparison first'); return; }
+  const rowsHtml = c.rows.map(r => `<tr>
+    <td class="p">${esc(r.p)}${r.rangeTxt?`<span class="ref">ref ${esc(r.rangeTxt)}</span>`:''}</td>
+    <td class="v ${r.aOor?'oor':''}">${r.a??'—'}</td>
+    <td class="v ${r.bOor?'oor':''}">${r.b??'—'} ${esc(r.unit||'')}</td>
+  </tr>`).join('');
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Lab comparison — ${esc(c.m.name)}</title>
+    <style>
+      body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1917;max-width:640px;margin:24px auto;padding:0 16px}
+      h1{font-size:20px;margin:0 0 2px} .sub{color:#78716c;font-size:13px;margin:0 0 16px}
+      table{width:100%;border-collapse:collapse;font-size:14px} th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:right}
+      th:first-child,td.p{text-align:left} th{color:#78716c;font-size:12px;border-bottom:2px solid #ddd}
+      td.p{font-weight:600} .ref{display:block;color:#a8a29e;font-weight:400;font-size:11px} .v{font-weight:700} .oor{color:#e11d48}
+      .ai{margin-top:18px;padding:12px;background:#f0fdfa;border:1px solid #ccfbf1;border-radius:10px;font-size:13px;white-space:pre-line}
+      .ai b{display:block;margin-bottom:4px;color:#0f766e} .foot{margin-top:16px;color:#a8a29e;font-size:11px}
+      @media print{body{margin:0}}
+    </style></head><body>
+    <h1>Lab comparison — ${esc(c.m.name)}</h1>
+    <p class="sub">${esc(c.RA.title)} · ${fmtDate(c.RA.date)}  →  ${fmtDate(c.RB.date)}</p>
+    <table><thead><tr><th>Parameter</th><th>${fmtDate(c.RA.date)}</th><th>${fmtDate(c.RB.date)}</th></tr></thead><tbody>${rowsHtml}</tbody></table>
+    ${c.insight?`<div class="ai"><b>AI summary</b>${esc(c.insight)}</div>`:''}
+    <p class="foot">Values in red are outside the reference range. This is general information to discuss with a doctor, not a diagnosis. Generated by HealthHub.</p>
+    <script>window.onload=function(){window.print();}<\/script>
+  </body></html>`;
+  const w = window.open('', '_blank');
+  if (!w) { showToast('Allow pop-ups to print'); return; }
+  w.document.write(html); w.document.close();
+}
 
 async function handleCompareInsight() {
   const reports = reportsWithLabs(state.currentId);
@@ -3125,6 +3209,12 @@ document.addEventListener('click', async (e) => {
       break;
     case 'run-compare':
       setState({ compareRun: true, compareInsight: null });
+      break;
+    case 'share-comparison':
+      await handleShareComparison();
+      break;
+    case 'print-comparison':
+      handlePrintComparison();
       break;
     case 'compare-insight':
       await handleCompareInsight();

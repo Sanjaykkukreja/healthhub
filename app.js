@@ -30,7 +30,7 @@ let state = {
   records: [],
   logs: [],
   metrics: [],
-  page: 'records',
+  page: 'home',
   sidebarOpen: true,
   memberMenuOpen: false,
   moreSheetOpen: false,
@@ -52,6 +52,8 @@ let state = {
   allFollowups: [],           // family-wide follow-ups (dated next-actions)
   allMedicines: [],           // family-wide medicines
   allDoctors: [],             // family-wide doctors directory
+  homeInsights: null,         // { content: {weeklyTip, members:[{mid,note,precautions}]}, generatedAt }
+  homeGenerating: false,
   medicineEditor: null,       // add/edit medicine modal
   doctorEditor: null,         // add/edit doctor modal
   followupEditor: null,       // { id?, mid, title, kind, dueDate, notes } add/edit follow-up modal
@@ -307,6 +309,16 @@ const db = {
   },
   async deleteDoctor(id) {
     const { error } = await supabaseClient.from('doctors').delete().eq('id', id);
+    if (error) throw error;
+  },
+  // ── Home weekly insights ──
+  async getHomeInsights(userId) {
+    const { data, error } = await supabaseClient.from('home_insights').select('*').eq('owner_id', userId).maybeSingle();
+    if (error) throw error;
+    return data ? { content: data.content, generatedAt: data.generated_at } : null;
+  },
+  async saveHomeInsights(userId, content) {
+    const { error } = await supabaseClient.from('home_insights').upsert([{ owner_id: userId, content, generated_at: new Date().toISOString() }], { onConflict: 'owner_id' });
     if (error) throw error;
   },
   async addMember(userId, data) {
@@ -2235,6 +2247,23 @@ function renderFollowupEditor() {
 //  LAYER 4 — TRENDS (same lab value over time)
 // ═════════════════════════════════════════
 // Canonical names so the same test lines up across labs (SGPT=ALT, etc.)
+// ═════════════════════════════════════════
+//  HOME — age/gender preventive-care milestones (rule-based, stable — not AI-generated)
+//  General, widely-published preventive guidance. Not personalized medical advice.
+// ═════════════════════════════════════════
+const AGE_MILESTONES = [
+  { min:0, max:17, items: ['Annual growth & vision/hearing check', 'Vaccination schedule up to date', 'Dental check-up twice a year'] },
+  { min:18, max:29, items: ['BP check every 2 years if normal', 'Dental check-up yearly', 'Eye check every 2 years', 'Skin self-check for new/changing moles'] },
+  { min:30, max:39, items: ['BP + blood sugar (fasting) yearly', 'Lipid profile every 2–3 years', 'Dental cleaning yearly', 'Women: cervical screening per doctor schedule'] },
+  { min:40, max:49, items: ['BP, fasting sugar, lipid profile — annually', 'ECG baseline if not done', 'Eye check yearly (presbyopia range begins)', 'Women: discuss mammogram baseline timing with doctor', 'Men: discuss prostate screening timing with doctor'] },
+  { min:50, max:59, items: ['Full annual health check (BP, sugar, lipids, kidney, liver)', 'Discuss colonoscopy screening window with doctor', 'Bone density discussion, especially post-menopause', 'Eye check yearly incl. glaucoma screening', 'Hearing check every 2–3 years'] },
+  { min:60, max:120, items: ['6-monthly BP, sugar, kidney & liver function', 'Annual ECG / cardiac check-in', 'Bone density (DEXA) periodically', 'Vision + hearing check yearly', 'Fall-risk & mobility check', 'Vaccination review (flu, pneumonia per doctor)'] },
+];
+function milestonesForAge(age) {
+  const bracket = AGE_MILESTONES.find(b => age >= b.min && age <= b.max) || AGE_MILESTONES[AGE_MILESTONES.length-1];
+  return bracket.items;
+}
+
 const LAB_ALIASES = {
   'sgpt':'ALT (SGPT)', 'alt':'ALT (SGPT)', 'alanine transaminase':'ALT (SGPT)', 'alanine aminotransferase':'ALT (SGPT)',
   'sgot':'AST (SGOT)', 'ast':'AST (SGOT)', 'aspartate transaminase':'AST (SGOT)', 'aspartate aminotransferase':'AST (SGOT)',
@@ -2501,26 +2530,32 @@ function handlePrintComparison() {
     <td class="v ${r.aOor?'oor':''}">${r.a??'—'}</td>
     <td class="v ${r.bOor?'oor':''}">${r.b??'—'} ${esc(r.unit||'')}</td>
   </tr>`).join('');
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>Lab comparison — ${esc(c.m.name)}</title>
+  const html = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Lab comparison — ${esc(c.m.name)}</title>
     <style>
-      body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1917;max-width:640px;margin:24px auto;padding:0 16px}
+      body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;color:#1c1917;max-width:640px;margin:0 auto;padding:16px}
       h1{font-size:20px;margin:0 0 2px} .sub{color:#78716c;font-size:13px;margin:0 0 16px}
       table{width:100%;border-collapse:collapse;font-size:14px} th,td{padding:8px 6px;border-bottom:1px solid #eee;text-align:right}
       th:first-child,td.p{text-align:left} th{color:#78716c;font-size:12px;border-bottom:2px solid #ddd}
       td.p{font-weight:600} .ref{display:block;color:#a8a29e;font-weight:400;font-size:11px} .v{font-weight:700} .oor{color:#e11d48}
       .ai{margin-top:18px;padding:12px;background:#f0fdfa;border:1px solid #ccfbf1;border-radius:10px;font-size:13px;white-space:pre-line}
       .ai b{display:block;margin-bottom:4px;color:#0f766e} .foot{margin-top:16px;color:#a8a29e;font-size:11px}
-      @media print{body{margin:0}}
+      .bar{position:sticky;top:0;background:#fff;padding:10px 0 12px;margin-bottom:8px;display:flex;gap:8px;border-bottom:1px solid #eee}
+      .bar button{flex:1;padding:12px;border-radius:10px;font-size:14px;font-weight:700;border:1px solid #d6d3d1;background:#fff;color:#44403c}
+      .bar .pr{background:#0d9488;color:#fff;border-color:#0d9488}
+      @media print{.bar{display:none} body{margin:0;padding:0}}
     </style></head><body>
+    <div class="bar">
+      <button class="pr" onclick="window.print()">Print / Save PDF</button>
+      <button onclick="window.close()">Close</button>
+    </div>
     <h1>Lab comparison — ${esc(c.m.name)}</h1>
     <p class="sub">${esc(c.RA.title)} · ${fmtDate(c.RA.date)}  →  ${fmtDate(c.RB.date)}</p>
     <table><thead><tr><th>Parameter</th><th>${fmtDate(c.RA.date)}</th><th>${fmtDate(c.RB.date)}</th></tr></thead><tbody>${rowsHtml}</tbody></table>
     ${c.insight?`<div class="ai"><b>AI summary</b>${esc(c.insight)}</div>`:''}
     <p class="foot">Values in red are outside the reference range. This is general information to discuss with a doctor, not a diagnosis. Generated by HealthHub.</p>
-    <script>window.onload=function(){window.print();}<\/script>
   </body></html>`;
   const w = window.open('', '_blank');
-  if (!w) { showToast('Allow pop-ups to print'); return; }
+  if (!w) { showToast('Allow pop-ups to open the printable page'); return; }
   w.document.write(html); w.document.close();
 }
 
@@ -2698,6 +2733,134 @@ function renderDoctorEditor() {
   </div>`;
 }
 
+// ═════════════════════════════════════════
+//  HOME  (weekly AI health card + family precautions + quick links)
+// ═════════════════════════════════════════
+function daysSince(iso) { if (!iso) return Infinity; return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000); }
+
+function renderHome() {
+  const insights = state.homeInsights;
+  const content = insights?.content;
+  const staleDays = insights ? daysSince(insights.generatedAt) : Infinity;
+  const members = activeMembers();
+
+  const dueCount = state.allFollowups.filter(f => f.status==='pending' && ['overdue','week'].includes(fuBucket(f.dueDate))).length;
+  const toClaim = state.allRecords.filter(r => (r.claimStatus||'none')==='to_claim').length;
+  const threadCount = state.allEpisodes.length;
+
+  const quickLinks = [
+    { page:'records', icon:'file-text', label:'Records', sub:`${state.allRecords.length} documents · ${threadCount} threads` },
+    { page:'upcoming', icon:'calendar-check', label:'Upcoming', sub: dueCount ? `${dueCount} due soon` : 'All caught up', hi: dueCount>0 },
+    { page:'trends', icon:'trending-up', label:'Compare Reports', sub:'Track lab values over time' },
+    { page:'spending', icon:'dollar-sign', label:'Spending', sub: toClaim ? `${toClaim} to claim` : 'Track family spend', hi: toClaim>0 },
+    { page:'medicines', icon:'pill', label:'Medicines', sub:`${state.allMedicines.filter(x=>x.active).length} active` },
+    { page:'doctors', icon:'stethoscope', label:'Doctors', sub:`${state.allDoctors.length} saved` },
+  ];
+
+  const memberCards = members.map(mem => {
+    const mi = content?.members?.find(x => x.mid === mem.id);
+    const stable = mem.age ? milestonesForAge(mem.age) : [];
+    return `<div class="bg-white rounded-2xl border border-stone-100 shadow-sm p-4">
+      <div class="flex items-center gap-3 mb-3">
+        <div class="w-10 h-10 rounded-full flex items-center justify-center text-white font-black flex-shrink-0" style="background:${mem.color}">${mem.avatar}</div>
+        <div><p class="font-bold text-stone-900 text-sm">${esc(mem.name)}</p><p class="text-xs text-stone-400">${mem.age?`${mem.age}y · `:''}${esc(mem.role)}${(mem.conditions||[]).length?` · ${esc(mem.conditions.slice(0,2).join(', '))}`:''}</p></div>
+      </div>
+      ${mi?.note ? `<p class="text-sm text-stone-700 mb-3">${esc(mi.note)}</p>` : ''}
+      ${mi?.precautions?.length ? `<div class="mb-3"><p class="text-xs font-black text-stone-400 uppercase tracking-wide mb-1.5">Worth watching, given their history</p><div class="space-y-1">${mi.precautions.map(p=>`<div class="flex items-start gap-1.5 text-xs text-stone-600"><span class="text-teal-500 mt-0.5">${iconHtml('circle-dot',10)}</span>${esc(p)}</div>`).join('')}</div></div>` : ''}
+      ${stable.length ? `<div><p class="text-xs font-black text-stone-400 uppercase tracking-wide mb-1.5">${mem.age?`${mem.age >= 60 ? 'Age 60+' : mem.age >= 50 ? '50s' : mem.age >= 40 ? '40s' : mem.age >= 30 ? '30s' : 'Standard'} checklist`:'General checklist'}</p><div class="grid grid-cols-1 gap-1">${stable.map(s=>`<div class="flex items-start gap-1.5 text-xs text-stone-500"><span class="text-stone-300 mt-0.5">${iconHtml('check',10)}</span>${esc(s)}</div>`).join('')}</div></div>` : `<p class="text-xs text-stone-300">Add ${esc(mem.name.split(' ')[0])}'s age in Family settings to see age-appropriate checks.</p>`}
+    </div>`;
+  }).join('');
+
+  return `<div class="fade-in max-w-2xl">
+    <!-- Weekly tip banner (illustration-style, not a photo) -->
+    <div class="rounded-2xl p-5 mb-4 relative overflow-hidden" style="background:linear-gradient(135deg,${C.teal}15,${C.violet}12)">
+      <div class="flex items-start gap-3">
+        <div class="w-11 h-11 rounded-2xl flex items-center justify-center flex-shrink-0" style="background:${C.teal}">${iconHtml('sparkles',20,'text-white')}</div>
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2">
+            <p class="text-xs font-black uppercase tracking-wide" style="color:${C.teal}">Tip of the week</p>
+            ${state.homeGenerating?badgeHtml('Updating…','bg-white/60 text-stone-500'):''}
+          </div>
+          <p class="font-bold text-stone-900 mt-0.5">${content?.weeklyTip?.title ? esc(content.weeklyTip.title) : (state.homeGenerating ? "Putting together your family's weekly update…" : 'Tap refresh to generate your first weekly update')}</p>
+          ${content?.weeklyTip?.text ? `<p class="text-sm text-stone-600 mt-1">${esc(content.weeklyTip.text)}</p>` : ''}
+        </div>
+      </div>
+      <div class="flex items-center justify-between mt-3 pt-3 border-t border-stone-900/5">
+        <p class="text-xs text-stone-400">${insights ? `Updated ${staleDays===0?'today':staleDays===1?'yesterday':staleDays+' days ago'}` : 'Not generated yet'}</p>
+        <button data-action="refresh-home" ${state.homeGenerating?'disabled':''} class="flex items-center gap-1.5 text-xs font-bold hover:underline disabled:opacity-50" style="color:${C.teal}">${iconHtml('refresh-cw',12,state.homeGenerating?'animate-spin':'')} Refresh</button>
+      </div>
+    </div>
+
+    <!-- Quick links -->
+    <div class="grid grid-cols-2 sm:grid-cols-3 gap-2.5 mb-5">
+      ${quickLinks.map(l => `<button data-action="goto" data-page="${l.page}" class="text-left bg-white rounded-xl border ${l.hi?'border-amber-200':'border-stone-100'} shadow-sm p-3 hover:shadow-md transition-shadow">
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-2" style="background:${l.hi?'#fef3c7':C.teal+'1a'}">${iconHtml(l.icon,15,l.hi?'text-amber-600':'')}</div>
+        <p class="text-xs font-bold text-stone-800">${l.label}</p>
+        <p class="text-xs ${l.hi?'text-amber-600 font-semibold':'text-stone-400'} mt-0.5">${l.sub}</p>
+      </button>`).join('')}
+    </div>
+
+    <!-- Per-person precautions -->
+    <p class="text-xs font-black text-stone-400 uppercase tracking-wider mb-2">For your family</p>
+    <div class="space-y-3">${memberCards}</div>
+    <p class="text-xs text-stone-300 text-center mt-4">General preventive-care information, personalized to what's on file — always confirm with a doctor.</p>
+  </div>`;
+}
+
+async function maybeRefreshHomeInsights() {
+  if (state.homeGenerating) return;
+  const staleDays = state.homeInsights ? daysSince(state.homeInsights.generatedAt) : Infinity;
+  if (staleDays >= 7) await generateHomeInsights();
+}
+
+async function generateHomeInsights() {
+  if (!state.session || activeMembers().length === 0) return;
+  setState({ homeGenerating: true });
+  const members = activeMembers().map(mem => {
+    // Pull any currently out-of-range test names for this member (grounds the AI in real data)
+    const flags = [];
+    try {
+      const recs = state.allRecords.filter(r => r.mid === mem.id && r.extracted?.keyValues?.length);
+      const seen = {};
+      recs.forEach(r => r.extracted.keyValues.forEach(kv => {
+        if (kv.status === 'high' || kv.status === 'low' || kv.status === 'critical') {
+          const nm = kv.std || kv.name; if (nm && !seen[nm]) { seen[nm] = true; flags.push(nm); }
+        }
+      }));
+    } catch (e) {}
+    return { mid: mem.id, name: mem.name, age: mem.age || null, gender: mem.gender || null, conditions: mem.conditions || [], recentFlags: flags.slice(0,6) };
+  });
+
+  const prompt = `You are a calm, knowledgeable family-health guide writing a weekly card for a caregiver in India managing multiple family members' health. For EACH person below, using ONLY their age, gender, known conditions, and recently-flagged lab values, write:
+- "note": one warm, specific sentence connecting their profile to what to focus on right now (not generic filler)
+- "precautions": 2-4 short bullet points of things worth watching or asking a doctor about, tied to THEIR actual conditions/flags where possible (may include general Indian-context options like yoga/walking/diet patterns, or specific tests). Never invent conditions they don't have. Never give drug names, dosages, or diagnoses.
+
+Also write ONE shared "weeklyTip": {"title": short catchy title, "text": one practical, general wellness tip (1-2 sentences) suitable for the whole family, India-appropriate (diet, movement, sleep, seasonal, or preventive-care awareness). Vary the theme each time — do not always pick the same topic.
+
+Respond with ONLY this JSON, no markdown, no commentary:
+{"weeklyTip":{"title":"","text":""},"members":[{"mid":"...","note":"...","precautions":["...","..."]}]}
+
+Family:
+${JSON.stringify(members, null, 0)}`;
+
+  try {
+    const res = await fetch(AI_ENDPOINT, {
+      method: 'POST', headers: AI_HEADERS,
+      body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 1200, messages: [{ role: 'user', content: prompt }] })
+    });
+    const d = await res.json();
+    let text = (d.content?.[0]?.text || '').trim();
+    text = text.replace(/^```json\s*|^```\s*|```$/g, '').trim();
+    const parsed = JSON.parse(text);
+    await db.saveHomeInsights(state.session.user.id, parsed);
+    setState({ homeGenerating: false, homeInsights: { content: parsed, generatedAt: new Date().toISOString() } });
+  } catch (e) {
+    console.error('Home insight generation failed', e);
+    setState({ homeGenerating: false });
+    showToast('Could not refresh the weekly update — try again');
+  }
+}
+
 // ── Settings page ──
 function renderSettings() {
   const email = state.session?.user?.email || '';
@@ -2745,6 +2908,7 @@ function renderSettings() {
 //  NAVIGATION
 // ─────────────────────────────────────────
 const NAV = [
+  { id:'home', label:'Home', icon:'home' },
   { id:'records', label:'Medical Records', icon:'file-text' },
   { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
   { id:'trends', label:'Trends', icon:'trending-up' },
@@ -2756,6 +2920,7 @@ const NAV = [
   { id:'settings', label:'Settings', icon:'settings' },
 ];
 const MOBILE_MAIN = [
+  { id:'home', label:'Home', icon:'home' },
   { id:'records', label:'Records', icon:'file-text' },
   { id:'upcoming', label:'Upcoming', icon:'calendar-check' },
   { id:'trends', label:'Trends', icon:'trending-up' },
@@ -2791,8 +2956,8 @@ function renderSidebar() {
 function renderBottomNav() {
   const onMore = MOBILE_MORE.some(n => n.id === state.page);
   return `<nav class="fixed bottom-0 left-0 right-0 z-30 bg-white border-t border-stone-100 flex md:hidden">
-    ${MOBILE_MAIN.map(n => `<button data-action="goto" data-page="${n.id}" class="flex-1 flex flex-col items-center gap-0.5 py-2.5" style="color:${state.page===n.id?C.teal:'#94a3b8'}">${iconHtml(n.icon,20)}<span class="text-xs font-bold">${n.label}</span></button>`).join('')}
-    <button data-action="open-more" class="flex-1 flex flex-col items-center gap-0.5 py-2.5" style="color:${onMore?C.teal:'#94a3b8'}">${iconHtml('more-horizontal',20)}<span class="text-xs font-bold">More</span></button>
+    ${MOBILE_MAIN.map(n => `<button data-action="goto" data-page="${n.id}" class="flex-1 flex flex-col items-center gap-0.5 py-2 min-w-0 px-0.5" style="color:${state.page===n.id?C.teal:'#94a3b8'}">${iconHtml(n.icon,18)}<span class="text-[10px] font-bold truncate">${n.label}</span></button>`).join('')}
+    <button data-action="open-more" class="flex-1 flex flex-col items-center gap-0.5 py-2 min-w-0 px-0.5" style="color:${onMore?C.teal:'#94a3b8'}">${iconHtml('more-horizontal',18)}<span class="text-[10px] font-bold">More</span></button>
   </nav>`;
 }
 
@@ -2856,6 +3021,7 @@ function renderPageContent() {
   }
   switch (state.page) {
     case 'dashboard': return renderDashboard();
+    case 'home': return renderHome();
     case 'records': return renderRecords();
     case 'upcoming': return renderUpcoming();
     case 'trends': return renderTrends();
@@ -2977,6 +3143,10 @@ document.addEventListener('click', async (e) => {
       break;
     case 'goto':
       setState({ page: el.dataset.page, memberMenuOpen: false, moreSheetOpen: false, recordSelectedId: null });
+      if (el.dataset.page === 'home') maybeRefreshHomeInsights();
+      break;
+    case 'refresh-home':
+      await generateHomeInsights();
       break;
     case 'goto-close-more':
       setState({ page: el.dataset.page, moreSheetOpen: false });
@@ -3430,14 +3600,15 @@ async function loadMemberData(memberId) {
 async function loadFamilyData() {
   if (!state.session) return;
   try {
-    const [allRecords, allEpisodes, allFollowups, allMedicines, allDoctors] = await Promise.all([
+    const [allRecords, allEpisodes, allFollowups, allMedicines, allDoctors, homeInsights] = await Promise.all([
       db.getAllRecords(state.session.user.id),
       db.getAllEpisodes(state.session.user.id),
       db.getAllFollowups(state.session.user.id),
       db.getAllMedicines(state.session.user.id).catch(() => []),
       db.getAllDoctors(state.session.user.id).catch(() => []),
+      db.getHomeInsights(state.session.user.id).catch(() => null),
     ]);
-    setState({ allRecords, allEpisodes, allFollowups, allMedicines, allDoctors });
+    setState({ allRecords, allEpisodes, allFollowups, allMedicines, allDoctors, homeInsights });
   } catch (e) { console.error(e); }
 }
 // Look up a record family-wide (falls back to current-member list)
@@ -3820,6 +3991,7 @@ async function loadMembersForSession(session) {
       state.lastUploadMemberId = self.id;
       await loadMemberData(self.id);
       await loadFamilyData();
+      if (state.page === 'home') maybeRefreshHomeInsights();
     }
   } catch (e) {
     console.error(e);

@@ -2225,7 +2225,9 @@ function renderFollowupEditor() {
           </select></div>
         <div class="grid grid-cols-2 gap-3">
           <div><label class="block text-xs font-bold text-stone-500 mb-1">Due date <span class="font-normal text-stone-400">(optional)</span></label>
-            <input id="fu-date" type="date" value="${ed.dueDate||''}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/></div>
+            <input id="fu-date" type="date" value="${ed.dueDate||''}" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600"/>
+            ${ed.dueDate?`<button type="button" data-action="clear-followup-date" class="text-xs font-bold text-stone-400 hover:text-rose-500 hover:underline mt-1">Clear — no specific date</button>`:''}
+          </div>
           <div><label class="block text-xs font-bold text-stone-500 mb-1">Type</label>
             <select id="fu-kind" class="w-full px-3 py-2.5 border border-stone-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-teal-600 bg-white">
               ${Object.keys(FU_KINDS).map(k=>`<option value="${k}" ${ (ed.kind||'review')===k?'selected':''}>${FU_KINDS[k].label}</option>`).join('')}
@@ -3142,6 +3144,9 @@ document.addEventListener('change', (e) => {
     setState({ compareRepA: e.target.value || null, compareRepB: null, compareRun: false, compareInsight: null });
   } else if (e.target.id === 'cmp-b') {
     setState({ compareRepB: e.target.value || null, compareRun: false, compareInsight: null });
+  } else if (e.target.id === 'fu-date' && state.followupEditor) {
+    // Keep state in sync as the date is picked, without re-rendering (avoids disrupting the native picker)
+    state.followupEditor.dueDate = e.target.value;
   }
 });
 document.addEventListener('click', async (e) => {
@@ -3191,8 +3196,11 @@ document.addEventListener('click', async (e) => {
       setState({ familyView: true, memberMenuOpen: false });
       break;
     // ── Follow-ups (Layer 3) ──
+    case 'clear-followup-date':
+      setState({ followupEditor: { ...state.followupEditor, dueDate: '' } });
+      break;
     case 'followup-add':
-      setState({ followupEditor: { mid: state.familyView ? (activeMembers()[0]?.id) : state.currentId, kind: 'review', title: '', dueDate: '', notes: '' } });
+      setState({ followupEditor: { mid: state.familyView ? (activeMembers()[0]?.id) : state.currentId, kind: 'review', title: '', dueDate: new Date().toISOString().slice(0,10), notes: '' } });
       break;
     case 'followup-edit': {
       const f = state.allFollowups.find(x => x.id === el.dataset.id);
@@ -3902,14 +3910,16 @@ async function handleSaveFollowup() {
   const val = k => document.getElementById('fu-' + k)?.value;
   const title = (val('title') || '').trim();
   const mid = val('member');
+  // Prefer the live DOM value; fall back to the synced state value (defensive against iOS date-input quirks)
+  const dueDate = val('date') || ed.dueDate || null;
   if (!title) { showToast('Please enter what needs doing'); return; }
   if (!mid) { showToast('Please pick a person'); return; }
   setState({ followupSaving: true });
   try {
     if (ed.id) {
-      await db.updateFollowup(ed.id, { title, kind: val('kind'), dueDate: val('date') || null, notes: (val('notes') || '').trim() });
+      await db.updateFollowup(ed.id, { title, kind: val('kind'), dueDate: dueDate || null, notes: (val('notes') || '').trim() });
     } else {
-      await db.addFollowup(state.session.user.id, { mid, title, kind: val('kind') || 'review', dueDate: val('date') || null, dateSource: 'explicit', notes: (val('notes') || '').trim() });
+      await db.addFollowup(state.session.user.id, { mid, title, kind: val('kind') || 'review', dueDate: dueDate || null, dateSource: 'explicit', notes: (val('notes') || '').trim() });
     }
     await loadFamilyData();
     setState({ followupSaving: false, followupEditor: null });

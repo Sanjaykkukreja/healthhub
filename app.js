@@ -2745,17 +2745,44 @@ function renderHome() {
   const members = activeMembers();
 
   const dueCount = state.allFollowups.filter(f => f.status==='pending' && ['overdue','week'].includes(fuBucket(f.dueDate))).length;
-  const toClaim = state.allRecords.filter(r => (r.claimStatus||'none')==='to_claim').length;
-  const threadCount = state.allEpisodes.length;
 
-  const quickLinks = [
-    { page:'records', icon:'file-text', label:'Records', sub:`${state.allRecords.length} documents · ${threadCount} threads` },
-    { page:'upcoming', icon:'calendar-check', label:'Upcoming', sub: dueCount ? `${dueCount} due soon` : 'All caught up', hi: dueCount>0 },
-    { page:'trends', icon:'trending-up', label:'Compare Reports', sub:'Track lab values over time' },
-    { page:'spending', icon:'dollar-sign', label:'Spending', sub: toClaim ? `${toClaim} to claim` : 'Track family spend', hi: toClaim>0 },
-    { page:'medicines', icon:'pill', label:'Medicines', sub:`${state.allMedicines.filter(x=>x.active).length} active` },
-    { page:'doctors', icon:'stethoscope', label:'Doctors', sub:`${state.allDoctors.length} saved` },
-  ];
+  // Section 1: What's Coming Up — top few pending follow-ups, family-wide, most urgent first
+  const urgencyRank = { overdue:0, week:1, month:2, later:3, nodate:4 };
+  const topFollowups = state.allFollowups
+    .filter(f => f.status === 'pending')
+    .slice().sort((a,b) => urgencyRank[fuBucket(a.dueDate)] - urgencyRank[fuBucket(b.dueDate)])
+    .slice(0, 3);
+  const followupSection = `<button data-action="goto" data-page="upcoming" class="w-full text-left bg-white rounded-2xl border border-stone-100 shadow-sm p-4 mb-3 block hover:shadow-md transition-shadow">
+    <div class="flex items-center justify-between mb-3">
+      <div class="flex items-center gap-2"><div class="w-8 h-8 rounded-lg flex items-center justify-center" style="background:${C.teal}1a">${iconHtml('calendar-check',15,'')}</div><p class="font-bold text-stone-900 text-sm">What's Coming Up</p>${dueCount?`<span class="text-xs font-bold text-rose-500">${dueCount} due soon</span>`:''}</div>
+      ${iconHtml('chevron-right',16,'text-stone-300')}
+    </div>
+    ${topFollowups.length === 0 ? `<p class="text-xs text-stone-400">All caught up — nothing pending right now.</p>` : `<div class="space-y-2">${topFollowups.map(f => {
+      const mem = memberById(f.mid); const overdue = fuBucket(f.dueDate)==='overdue';
+      return `<div class="flex items-center gap-2.5">
+        ${mem?`<div class="w-6 h-6 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:10px;font-weight:800">${mem.avatar}</div>`:''}
+        <p class="text-sm text-stone-700 flex-1 truncate">${esc(f.title)}</p>
+        <span class="text-xs font-semibold ${overdue?'text-rose-500':'text-stone-400'} flex-shrink-0">${fmtRelDate(f.dueDate)}</span>
+      </div>`;
+    }).join('')}</div>`}
+  </button>`;
+
+  // Section 2: Medicines — top few active medicines across the family
+  const topMeds = state.allMedicines.filter(x => x.active).slice(0, 4);
+  const medSection = `<button data-action="goto" data-page="medicines" class="w-full text-left bg-white rounded-2xl border border-stone-100 shadow-sm p-4 mb-5 block hover:shadow-md transition-shadow">
+    <div class="flex items-center justify-between mb-3">
+      <div class="flex items-center gap-2"><div class="w-8 h-8 rounded-lg flex items-center justify-center" style="background:${C.teal}1a">${iconHtml('pill',15,'')}</div><p class="font-bold text-stone-900 text-sm">Medicines</p></div>
+      ${iconHtml('chevron-right',16,'text-stone-300')}
+    </div>
+    ${topMeds.length === 0 ? `<p class="text-xs text-stone-400">No medicines added yet.</p>` : `<div class="space-y-2">${topMeds.map(md => {
+      const mem = memberById(md.mid);
+      return `<div class="flex items-center gap-2.5">
+        ${mem?`<div class="w-6 h-6 rounded-full flex items-center justify-center text-white flex-shrink-0" style="background:${mem.color};font-size:10px;font-weight:800">${mem.avatar}</div>`:''}
+        <p class="text-sm text-stone-700 flex-1 truncate">${esc(md.name)}${md.dose?` · ${esc(md.dose)}`:''}</p>
+        <span class="text-xs text-stone-400 flex-shrink-0 truncate max-w-[35%]">${esc(md.freq||'')}</span>
+      </div>`;
+    }).join('')}${state.allMedicines.filter(x=>x.active).length > 4?`<p class="text-xs text-stone-400 pt-1">+${state.allMedicines.filter(x=>x.active).length-4} more</p>`:''}</div>`}
+  </button>`;
 
   const memberCards = members.map(mem => {
     const mi = content?.members?.find(x => x.mid === mem.id);
@@ -2791,14 +2818,9 @@ function renderHome() {
       </div>
     </div>
 
-    <!-- Quick links -->
-    <div class="grid grid-cols-2 sm:grid-cols-3 gap-2.5 mb-5">
-      ${quickLinks.map(l => `<button data-action="goto" data-page="${l.page}" class="text-left bg-white rounded-xl border ${l.hi?'border-amber-200':'border-stone-100'} shadow-sm p-3 hover:shadow-md transition-shadow">
-        <div class="w-8 h-8 rounded-lg flex items-center justify-center mb-2" style="background:${l.hi?'#fef3c7':C.teal+'1a'}">${iconHtml(l.icon,15,l.hi?'text-amber-600':'')}</div>
-        <p class="text-xs font-bold text-stone-800">${l.label}</p>
-        <p class="text-xs ${l.hi?'text-amber-600 font-semibold':'text-stone-400'} mt-0.5">${l.sub}</p>
-      </button>`).join('')}
-    </div>
+    <!-- What's coming up + Medicines — clickable previews -->
+    ${followupSection}
+    ${medSection}
 
     <!-- Per-person precautions -->
     <p class="text-xs font-black text-stone-400 uppercase tracking-wider mb-2">For your family</p>
@@ -2831,9 +2853,9 @@ async function generateHomeInsights() {
     return { mid: mem.id, name: mem.name, age: mem.age || null, gender: mem.gender || null, conditions: mem.conditions || [], recentFlags: flags.slice(0,6) };
   });
 
-  const prompt = `You are a calm, knowledgeable family-health guide writing a weekly card for a caregiver in India managing multiple family members' health. For EACH person below, using ONLY their age, gender, known conditions, and recently-flagged lab values, write:
-- "note": one warm, specific sentence connecting their profile to what to focus on right now (not generic filler)
-- "precautions": 2-4 short bullet points of things worth watching or asking a doctor about, tied to THEIR actual conditions/flags where possible (may include general Indian-context options like yoga/walking/diet patterns, or specific tests). Never invent conditions they don't have. Never give drug names, dosages, or diagnoses.
+  const prompt = `You are a calm, encouraging family-health guide writing a weekly card for a caregiver in India managing multiple family members' health. For EACH person below, using ONLY their age, gender, known conditions, and recently-flagged lab values, write:
+- "note": one warm, encouraging sentence that still deals honestly with their real situation — acknowledge what's stable or going well if anything is, but do NOT minimize, soften, or omit any real flagged issue. Positive tone, complete substance — never positive by leaving something out.
+- "precautions": a COMPLETE list covering every recently-flagged value listed for this person (do not skip any), phrased constructively (e.g. "GGT and ALT are still elevated — worth a follow-up liver panel" rather than an alarming tone), plus 1-2 general preventive additions (yoga/walking/diet pattern, or a specific test) appropriate to their age/conditions. Never invent conditions they don't have. Never give drug names, dosages, or diagnoses.
 
 Also write ONE shared "weeklyTip": {"title": short catchy title, "text": one practical, general wellness tip (1-2 sentences) suitable for the whole family, India-appropriate (diet, movement, sleep, seasonal, or preventive-care awareness). Vary the theme each time — do not always pick the same topic.
 

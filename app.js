@@ -486,7 +486,8 @@ Respond with ONLY valid JSON (no markdown fences):
 For BILLS: set amount as number, fill billItems array.
 For LAB REPORTS: extract every test value with reference range, flag abnormals.
 For PRESCRIPTIONS: extract every medication with full dosing instructions.
-Handle: handwritten Rx, any Indian lab format (SRL, Lal Path, Metropolis, Apollo, Thyrocare etc.), Hindi+English mixed, angled photos, PDFs.`;
+Handle: handwritten Rx, any Indian lab format (SRL, Lal Path, Metropolis, Apollo, Thyrocare etc.), Hindi+English mixed, angled photos, PDFs.
+Output compact JSON on as few lines as possible — no pretty-printing, no extra indentation or whitespace between fields — to keep the response short.`;
 
 async function analyseDocument(file) {
   const isPDF = file.type === 'application/pdf';
@@ -500,14 +501,62 @@ async function analyseDocument(file) {
     : { type: 'image', source: { type: 'base64', media_type: mediaType, data: b64 } };
   const res = await fetch(AI_ENDPOINT, {
     method: 'POST', headers: AI_HEADERS,
-    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 2000, messages: [{ role: 'user', content: [block, { type: 'text', text: EXTRACT_PROMPT }] }] })
+    // max_tokens raised from 2000 → 3200: reports with many lab values (12+ parameters) were
+    // running out of room mid-JSON, truncating the response and breaking parsing ("Expected ']'").
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: 3200, messages: [{ role: 'user', content: [block, { type: 'text', text: EXTRACT_PROMPT }] }] })
   });
   if (!res.ok) throw new Error(`AI error (${res.status})`);
   const d = await res.json();
   if (d.error) throw new Error(d.error.message);
   const raw = (d.content?.[0]?.text || '').replace(/```json\n?|```\n?/g, '').trim();
   try { return JSON.parse(raw); }
-  catch { const m = raw.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error('Could not parse AI response'); }
+  catch {
+    // Response likely got cut off mid-structure — try to repair a truncated JSON object
+    // (close any dangling string/array/object) before giving up entirely.
+    try { return JSON.parse(repairTruncatedJson(raw)); }
+    catch {
+      const m = raw.match(/\{[\s\S]*\}/);
+      if (m) { try { return JSON.parse(m[0]); } catch { try { return JSON.parse(repairTruncatedJson(m[0])); } catch {} } }
+      throw new Error('Could not parse AI response — the document may be too complex, or the response got cut off.');
+    }
+  }
+}
+
+// Best-effort repair for a JSON string that was cut off mid-generation (hit the token limit).
+// Closes an unterminated string and any open objects/arrays, dropping a trailing incomplete field.
+function repairTruncatedJson(s) {
+  let inStr = false, esc = false;
+  const stack = [];
+  let lastSafeEnd = -1; // index just after the last complete value (comma or closing bracket) outside a string
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{' || c === '[') stack.push(c);
+    else if (c === '}' || c === ']') stack.pop();
+    else if ((c === ',' || c === '}' || c === ']') ) lastSafeEnd = i + 1;
+  }
+  let repaired = s;
+  if (inStr) {
+    // Cut back to the last safe point instead of guessing how to close a broken string
+    repaired = lastSafeEnd > -1 ? s.slice(0, lastSafeEnd) : s;
+  }
+  repaired = repaired.replace(/,\s*$/, ''); // drop a dangling trailing comma
+  // Re-walk to find any still-open brackets after the trim, and close them in order
+  let stack2 = []; inStr = false; esc = false;
+  for (let i = 0; i < repaired.length; i++) {
+    const c = repaired[i];
+    if (esc) { esc = false; continue; }
+    if (c === '\\') { esc = true; continue; }
+    if (c === '"') { inStr = !inStr; continue; }
+    if (inStr) continue;
+    if (c === '{' || c === '[') stack2.push(c);
+    else if (c === '}' || c === ']') stack2.pop();
+  }
+  for (let i = stack2.length - 1; i >= 0; i--) repaired += stack2[i] === '{' ? '}' : ']';
+  return repaired;
 }
 
 // ─────────────────────────────────────────
@@ -778,7 +827,94 @@ function openUploadModal() {
 }
 function closeUploadModal() { setState({ uploadModal: null }); }
 
+// Resize + re-compress a photo before it's read by AI or stored — cuts both AI cost
+// (fewer image tokens) and Supabase storage size. Falls back to the original file on
+// any failure (unsupported format, decode error) so it never blocks an upload.
+async function compressImage(file) {
+  const isPdf = file.type === 'application/pdf';
+  const looksLikeImage = file.type.startsWith('image/') || /\.(heic|heif)$/i.test(file.name || '');
+  if (isPdf || !looksLikeImage) return file; // PDFs pass through untouched
+  try {
+    let bitmap;
+    try { bitmap = await createImageBitmap(file); }
+    catch {
+      // Fallback path for formats createImageBitmap can't decode directly in this browser
+      bitmap = await new Promise((resolve, reject) => {
+        const img = new Image();
+        const url = URL.createObjectURL(file);
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = url;
+      });
+    }
+    const w = bitmap.width, h = bitmap.height;
+    const MAX_DIM = 1600;
+    const scale = Math.min(1, MAX_DIM / Math.max(w, h));
+    // Skip re-encoding if it's already small — no point doing the work
+    if (scale === 1 && file.size < 900 * 1024) { if (bitmap.close) bitmap.close(); return file; }
+    const outW = Math.max(1, Math.round(w * scale)), outH = Math.max(1, Math.round(h * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = outW; canvas.height = outH;
+    canvas.getContext('2d').drawImage(bitmap, 0, 0, outW, outH);
+    if (bitmap.close) bitmap.close();
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.82));
+    if (!blob) return file;
+    const newName = (file.name || 'document').replace(/\.\w+$/, '') + '.jpg';
+    return new File([blob], newName, { type: 'image/jpeg' });
+  } catch (e) {
+    console.warn('Image compression skipped, using original file:', e);
+    return file;
+  }
+}
+
+// Combine several photos into one PDF (one photo per page) — for multi-page documents
+// like a 2-3 page discharge summary shot as separate photos. Each page is compressed first.
+async function combineImagesToPdf(files) {
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+  for (let i = 0; i < files.length; i++) {
+    const f = await compressImage(files[i]);
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(f);
+    });
+    const dims = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve({ w: img.naturalWidth, h: img.naturalHeight });
+      img.onerror = reject;
+      img.src = dataUrl;
+    });
+    if (i > 0) doc.addPage();
+    const pageW = doc.internal.pageSize.getWidth(), pageH = doc.internal.pageSize.getHeight();
+    const margin = 20;
+    const scale = Math.min((pageW - margin*2) / dims.w, (pageH - margin*2) / dims.h);
+    const w = dims.w * scale, h = dims.h * scale;
+    doc.addImage(dataUrl, 'JPEG', (pageW - w) / 2, (pageH - h) / 2, w, h);
+  }
+  const blob = doc.output('blob');
+  return new File([blob], `combined-${Date.now()}.pdf`, { type: 'application/pdf' });
+}
+
+// Multiple photos picked at once on the select screen — combine into one PDF, then
+// route it through the normal flow (AI or manual, whichever mode is active).
+async function handleMultiFilesPicked(fileList) {
+  const files = Array.from(fileList || []);
+  if (files.length === 0) return;
+  if (files.length === 1) { handlePickedFile(files[0]); return; }
+  showToast(`Combining ${files.length} photos into one document…`);
+  try {
+    const pdfFile = await combineImagesToPdf(files);
+    handlePickedFile(pdfFile);
+  } catch (e) {
+    console.error(e);
+    showToast('Could not combine those photos — try one at a time, or use "Attach document"');
+  }
+}
+
 async function runUploadAnalysis(file) {
+  file = await compressImage(file);
   setState({ uploadModal: { ...state.uploadModal, phase: 'analysing', file, pct: 5, progressMsg: 'Reading your file…' } });
   let si = 0;
   const tick = setInterval(() => {
@@ -955,6 +1091,7 @@ function renderUploadModal() {
       <div class="space-y-3">
         <input type="file" id="upload-file-input" accept="image/*,.pdf,.heic,.heif" class="hidden"/>
         <input type="file" id="upload-camera-input" accept="image/*" capture="environment" class="hidden"/>
+        <input type="file" id="upload-multi-input" accept="image/*" multiple class="hidden"/>
 
         <!-- AI vs Manual toggle -->
         <div class="inline-flex bg-stone-100 rounded-xl p-1 w-full">
@@ -968,6 +1105,9 @@ function renderUploadModal() {
         </div>
         <button id="upload-camera-btn" class="w-full flex items-center justify-center gap-2.5 py-3.5 border border-stone-200 rounded-xl text-sm font-bold text-stone-600 hover:bg-stone-50 transition-colors">
           ${iconHtml('camera', 18, 'text-teal-600')} Take a photo of document
+        </button>
+        <button id="upload-multi-btn" class="w-full flex items-center justify-center gap-2.5 py-3 border border-dashed border-stone-200 rounded-xl text-xs font-bold text-stone-500 hover:border-teal-400 hover:bg-teal-50 transition-colors">
+          ${iconHtml('layers', 15, 'text-teal-600')} Multiple pages? Select several photos → combines into one document
         </button>
         ${manual
           ? `<div class="bg-teal-50 rounded-2xl p-4 border border-teal-100"><p class="text-xs text-teal-800 flex items-start gap-2">${iconHtml('info',13,'text-teal-600 flex-shrink-0 mt-0.5')} <span><strong>Manual mode:</strong> your file is stored, then you type the details yourself. AI won't run (saves cost, works even with no credit).</span></p>
@@ -3573,6 +3713,10 @@ function wireUploadModalInputs() {
   if (fileInput) fileInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) handlePickedFile(f); };
   if (camBtn && camInput) camBtn.onclick = () => camInput.click();
   if (camInput) camInput.onchange = (e) => { const f = e.target.files?.[0]; if (f) handlePickedFile(f); };
+  const multiInput = document.getElementById('upload-multi-input');
+  const multiBtn = document.getElementById('upload-multi-btn');
+  if (multiBtn && multiInput) multiBtn.onclick = () => multiInput.click();
+  if (multiInput) multiInput.onchange = (e) => { handleMultiFilesPicked(e.target.files); e.target.value = ''; };
   // Manual-phase attach (stores the file WITHOUT triggering AI)
   const manFile = document.getElementById('man-file-input');
   const manCam = document.getElementById('man-camera-input');
@@ -3593,7 +3737,8 @@ function handlePickedFile(f) {
   }
 }
 // Open the manual details form with a file already attached (no AI).
-function openManualWithFile(f) {
+async function openManualWithFile(f) {
+  f = await compressImage(f);
   const um = state.uploadModal || {};
   const manual = { title: '', type: 'report', date: new Date().toISOString().slice(0,10), amount: '', doctor: '', hospital: '', summary: '' };
   const target = state.uploadTargetId || state.lastUploadMemberId || state.currentId;
@@ -3602,7 +3747,8 @@ function openManualWithFile(f) {
 }
 
 // Attach (or replace) a file in the manual entry form. Preserves whatever fields are already typed.
-function attachManualFile(f) {
+async function attachManualFile(f) {
+  f = await compressImage(f);
   const cur = captureManualFields();
   setState({ uploadModal: { ...state.uploadModal, file: f, manual: { ...state.uploadModal.manual, ...cur } } });
   setTimeout(wireUploadModalInputs, 30);
